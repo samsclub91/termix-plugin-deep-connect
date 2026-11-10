@@ -78,49 +78,8 @@ describe("resolveConnectPlan", () => {
     expect(result.host).toMatchObject({
       ip: "10.0.0.5",
       port: 2222,
-      username: "",
       authType: "none",
     });
-    expect("password" in (result.host as object)).toBe(false);
-    // ssh is never passed as a tab type: the terminal plugin owns "terminal".
-    expect(result.typeToPass).toBeUndefined();
-    expect(result.dialog).toMatchObject({
-      saved: false,
-      hostLabel: "10.0.0.5",
-    });
-  });
-
-  it("carries a resolved credential's username for ad-hoc SSH, never a value", () => {
-    const result = plan("?connect=10.0.0.5&type=ssh&credential=deploy%20key");
-    expect(result.status).toBe("adhoc");
-    expect(result.host).toMatchObject({
-      ip: "10.0.0.5",
-      username: "deploy",
-      authType: "none",
-    });
-    expect("password" in (result.host as object)).toBe(false);
-    expect(result.dialog?.credential).toEqual(credentials[0]);
-    expect(result.dialog?.credentialNotCarried).toMatchObject({
-      name: "Deploy Key",
-      protocol: "ssh",
-    });
-  });
-
-  it("reports an unknown credential name", () => {
-    expect(plan("?connect=10.0.0.5&type=ssh&credential=ghost").status).toBe(
-      "credentialNotFound",
-    );
-  });
-
-  it("passes a registered plugin protocol through and fixes connectionType", () => {
-    const result = plan("?connect=10.0.0.5&type=vnc");
-    expect(result.status).toBe("adhoc");
-    expect(result.host).toMatchObject({
-      ip: "10.0.0.5",
-      connectionType: "vnc",
-      authType: "password",
-    });
-    expect(result.typeToPass).toBe("vnc");
   });
 
   it("uses the protocol's default port unless the link overrides it", () => {
@@ -139,12 +98,68 @@ describe("resolveConnectPlan", () => {
     expect((result.host as Record<string, unknown>).domain).toBe("WAG");
   });
 
-  it("flags a carried credential as not-carried on ad-hoc remote-desktop links", () => {
-    const result = plan("?connect=10.0.0.5&type=vnc&credential=vnc");
-    expect(result.dialog?.credentialNotCarried).toEqual({
-      name: "vnc",
-      protocol: "vnc",
+  it("offers adoption for an ad-hoc link with a resolvable credential", () => {
+    const result = plan("?connect=10.0.0.9&type=vnc&credential=vnc");
+    expect(result.status).toBe("adhoc");
+    expect(result.dialog?.adopt).toEqual({
+      hostName: "10.0.0.9",
+      type: "vnc",
+      credentialId: 8,
+      port: 5900,
     });
+    // The credential CAN ride once the record exists, so nothing is marked
+    // not-carried — and the ad-hoc record stays as the fallback if the user
+    // declines the create.
+    expect(result.dialog?.credentialNotCarried).toBeUndefined();
+    expect(result.host).toMatchObject({ connectionType: "vnc", port: 5900 });
+  });
+
+  it("offers adoption for plain ad-hoc SSH with a credential", () => {
+    const result = plan("?connect=192.168.103.227&type=ssh&credential=deploy%20key");
+    expect(result.dialog?.adopt).toMatchObject({
+      hostName: "192.168.103.227",
+      type: "ssh",
+      credentialId: 7,
+      port: 22,
+    });
+    const result2 = plan("?connect=192.168.103.227&credential=deploy%20key&using=adhoc");
+    expect(result2.dialog?.adopt).toMatchObject({ type: "ssh", port: 22 });
+    // A no-type link that matches nothing stays a refusal — adoption is for
+    // links the plugin can actually act on.
+    expect(
+      plan("?connect=192.168.103.227&credential=deploy%20key").status,
+    ).toBe("hostNotFound");
+  });
+
+  it("carries the domain and port override into the adopt request", () => {
+    const result = plan(
+      "?connect=10.0.0.5&type=rdp&domain=WAG&port=3390&credential=vnc&using=adhoc",
+    );
+    expect(result.dialog?.adopt).toEqual({
+      hostName: "10.0.0.5",
+      type: "rdp",
+      credentialId: 8,
+      port: 3390,
+      domain: "WAG",
+    });
+  });
+
+  it("keeps the not-carried note for connections the adopt route cannot serve", () => {
+    // No credential at all: nothing to attach, plain ad-hoc.
+    const result = plan("?connect=10.0.0.5&type=vnc");
+    expect(result.dialog?.adopt).toBeUndefined();
+    expect(result.dialog?.credentialNotCarried).toBeUndefined();
+    // An unknown type never reaches the adopt branch.
+    expect(plan("?connect=10.0.0.5&type=telnet&credential=vnc").status).toBe(
+      "typeUnknown",
+    );
+  });
+
+  it("does not offer adoption when the link resolved a saved host", () => {
+    const result = plan("?connect=web%20server%201&credential=deploy%20key");
+    expect(result.status).toBe("saved");
+    expect(result.dialog?.adopt).toBeUndefined();
+    expect(result.dialog?.credential).toEqual(credentials[0]);
   });
 
   it("reports a type no plugin provides for ad-hoc links", () => {

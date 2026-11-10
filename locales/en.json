@@ -1,11 +1,11 @@
 {
   "plugin": {
     "name": "Lansweeper Connector",
-    "description": "Opens Termix sessions from Lansweeper asset links: connects saved hosts or ad-hoc addresses over SSH, RDP or VNC, with a confirm before every connect."
+    "description": "Opens Termix sessions from URLs (built for Lansweeper asset links): connects saved hosts or ad-hoc addresses over SSH, RDP or VNC, with a confirm before every connect."
   },
   "tab": {
     "title": "Connect from link",
-    "empty": "Paste a Lansweeper connect link in your browser to use this view."
+    "empty": "Paste a connect link in your browser to use this view."
   },
   "handoff": {
     "opening": "Opening Termix",
@@ -21,6 +21,15 @@
     "confirmDescription": "A session for {{host}} opens in a new tab.",
     "credentialNote": "Using credential {{name}}.",
     "adhocCredentialNote": "{{name}} will be asked for in the session (saved credentials cannot be carried on ad-hoc {{protocol}} links yet).",
+    "adoptTitle": "Create {{host}} and connect?",
+    "adoptDescription": "Create a saved host named {{host}} in the Ad-Hoc Hosts folder with credential {{name}} attached, then connect to it. The host record keeps this link working from now on; the credential is referenced, never read.",
+    "adoptAction": "Create & connect",
+    "adoptCreated": "Host {{host}} created in the Ad-Hoc Hosts folder.",
+    "adoptUnavailable": "Could not create the host; the ad-hoc session opens instead.",
+    "adoptUpdateTitle": "Update {{host}} and connect?",
+    "adoptUpdateDescription": "This link needs {{protocol}} on the existing host {{host}}: adds the connection using credential {{name}} (referenced, never read), then connects.", 
+    "adoptUpdateAction": "Update & connect",
+    "adoptUpdated": "Connection added to {{host}}.",
     "viewOnlyNote": "The link asks for view only; Termix opens it normally in this version.",
     "openAction": "Open session",
     "hostNotFound": "No saved host matches {{host}}.",

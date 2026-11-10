@@ -1,8 +1,8 @@
 {
   "id": "lansweeper-connector",
   "name": "Lansweeper Connector",
-  "version": "1.0.0",
-  "description": "Opens Termix sessions from Lansweeper asset links: connects saved hosts or ad-hoc addresses over SSH, RDP or VNC, with a confirm before every connect.",
+  "version": "1.1.0",
+  "description": "Opens Termix sessions from URLs (built for Lansweeper asset links): connects saved hosts or ad-hoc addresses over SSH, RDP or VNC, with a confirm before every connect.",
   "author": {
     "name": "Andrew Hancock",
     "url": "https://github.com/samsclub91"
@@ -13,9 +13,10 @@
   "category": "Infrastructure",
   "icon": "Monitor",
   "features": [
-    "Open a Termix session from any Lansweeper asset action link",
+    "Open a Termix session from any URL: built for Lansweeper asset action links, works from anywhere",
     "Saved hosts connect by name or address with their own logins",
     "Ad-hoc quick connects to addresses over SSH, RDP or VNC",
+    "On your confirm, ad-hoc links can become saved hosts in the Ad-Hoc Hosts folder with a credential attached by reference",
     "Every connect shows a confirm dialog first; links never carry secrets"
   ],
   "engine": {
@@ -25,7 +26,9 @@
   "capabilities": [
     "ui:surface",
     "hosts:read",
-    "credentials:use"
+    "hosts:write",
+    "credentials:use",
+    "network:serve"
   ],
   "contributes": {
     "tabs": [

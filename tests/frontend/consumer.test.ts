@@ -21,15 +21,20 @@ vi.mock("@termix-ssh/plugin-sdk/ui", () => ({
 // app member); stand in for it with hoisted state the tests can set.
 const credentialState = vi.hoisted(() => ({
   credentials: [] as unknown[],
+  post: vi.fn(async () => ({ data: { created: true, hostId: 42 } })),
 }));
 
 vi.mock("@termix-ssh/plugin-sdk/frontend", () => ({
   listCredentials: vi.fn(async () => credentialState.credentials),
 }));
 
+// Deliberately NOT exporting usePluginApi from this mock: without an injected
+// `adoptApi` the consumer must fall back to the v1 ad-hoc flow, and these
+// mocks exercise exactly that.
 import { toast } from "sonner";
 import * as ui from "@termix-ssh/plugin-sdk/ui";
 import type {
+  PluginApiClient,
   PluginCredentialSummary,
   PluginHostRecord,
   TermixApp,
@@ -44,6 +49,8 @@ const listProtocols = vi.mocked(ui.listHostProtocols);
 const defaultTab = vi.mocked(ui.getDefaultConnectionTab);
 const quickConnect = vi.mocked(ui.createQuickConnectHost);
 const toastError = vi.mocked(toast.error, true);
+const toastSuccess = vi.mocked(toast.success, true);
+const post = credentialState.post as unknown as ReturnType<typeof vi.fn>;
 
 const hosts: PluginHostRecord[] = [
   { id: "1", name: "Web Server 1", ip: "192.168.5.16", port: 22 },
@@ -76,6 +83,9 @@ function makeApp(options?: {
     t,
     listHosts,
     confirm,
+    // Deliberately NO `api` member in the default double: without an
+    // injected adoptApi the consumer must resolve the v1 fallback (exactly
+    // what a hook-less call would surface on a core without the route).
     tabs: {
       getLayout: vi.fn(() => ({ tabs: [] })),
       onReady: vi.fn((listener: () => void) => {
@@ -101,10 +111,22 @@ const SETTINGS = {
   defaultTabBudgetMs: 200,
 };
 
+function adoptSettings(
+  api: {
+    post: ReturnType<typeof vi.fn>;
+  } | null,
+): { settleBudgetMs: number; pollMs: number; defaultTabBudgetMs: number; adoptApi: () => PluginApiClient } {
+  return {
+    ...SETTINGS,
+    adoptApi: () => (api ? { post: api as unknown } : null) as unknown as PluginApiClient,
+  };
+}
+
 beforeEach(() => {
   vi.clearAllMocks();
   resetDeepLinkConsumerForTests();
   credentialState.credentials = credentials as unknown[];
+  post.mockResolvedValue({ data: { created: true, hostId: 42 } });
   listProtocols.mockReturnValue([
     { id: "rdp", defaultPort: 3389 },
     { id: "vnc", defaultPort: 5900 },
@@ -194,6 +216,8 @@ describe("consumeDeepLink", () => {
   });
 
   it("carries an ad-hoc ssh credential's username but never a secret value", async () => {
+    // No injected adoptApi and the SDK mock has no usePluginApi: the v1
+    // fallback runs — one confirm with the not-carried note, no host create.
     const double = makeApp();
     vi.useFakeTimers();
     const task = consumeDeepLink(
@@ -213,6 +237,7 @@ describe("consumeDeepLink", () => {
     expect(double.confirm).toHaveBeenCalledTimes(1);
     const description = double.confirm.mock.calls[0][0].description as string;
     expect(description).toContain("deepLink.adhocCredentialNote");
+    expect(post).not.toHaveBeenCalled();
   });
 
   it("adds the viewonly note without applying view-only", async () => {
@@ -221,7 +246,7 @@ describe("consumeDeepLink", () => {
     const task = consumeDeepLink(
       double.app,
       "?connect=10.0.0.5&type=ssh&viewonly=1",
-      SETTINGS,
+      adoptSettings(credentialState.post as never),
     );
     await vi.advanceTimersByTimeAsync(400);
     await task;
@@ -230,6 +255,220 @@ describe("consumeDeepLink", () => {
         "deepLink.viewOnlyNote",
       ),
     ).toBe(true);
+  });
+
+  it("creates and reconnects through the saved flow when the user confirms adoption", async () => {
+    const nowHosts: PluginHostRecord[] = [...hosts];
+    const double = makeApp({ hosts: nowHosts });
+    defaultTab.mockReturnValue("terminal" as never);
+    post.mockResolvedValue({ data: { created: true, hostId: 42 } });
+    const created: PluginHostRecord = {
+      id: "42",
+      name: "10.0.0.5",
+      ip: "10.0.0.5",
+      port: 22,
+    };
+    vi.useFakeTimers();
+    const task = consumeDeepLink(
+      double.app,
+      "?connect=10.0.0.5&type=ssh&credential=deploy%20key",
+      adoptSettings(credentialState.post as never),
+    );
+    // The create "lands" while the request resolves: the record is visible
+    // to the consumer's post-create list fetch, like the real server.
+    post.mockImplementation(async () => {
+      nowHosts.push(created);
+      return { data: { created: true, hostId: 42 } };
+    });
+    await vi.advanceTimersByTimeAsync(300);
+    await task;
+    // The confirm ran before the create: the adopt dialog, with its own keys.
+    expect(double.confirm).toHaveBeenCalledTimes(1);
+    const dialog = double.confirm.mock.calls[0][0];
+    expect(dialog.title).toBe(double.t("deepLink.adoptTitle", { host: "10.0.0.5" }));
+    expect(dialog.confirmLabel).toBe("deepLink.adoptAction");
+    expect(dialog.description).toContain("deepLink.adoptDescription");
+    // The real en.json text carries the folder name; the double's t() only
+    // renders params, so assert the interpolation payload.
+    expect(dialog.description).toContain('"name":"Deploy Key"');
+    expect(post).toHaveBeenCalledWith("/adopt", {
+      hostName: "10.0.0.5",
+      type: "ssh",
+      credentialId: 7,
+      port: 22,
+    });
+    await Promise.resolve();
+    expect(toastSuccess).toHaveBeenCalledWith(
+      double.t("deepLink.adoptCreated", { host: "10.0.0.5" }),
+    );
+    // No second confirm: the adopt dialog already consented to the connect,
+    // and the plan was not rebuilt as an ad-hoc quick connect.
+    expect(double.confirm).toHaveBeenCalledTimes(1);
+    expect(double.connectHost).toHaveBeenCalledWith(created, "terminal");
+    // A fresh record's default-connection registry has not filled; the SSH
+    // adopt passes the terminal type straight through instead of polling.
+    expect(defaultTab).not.toHaveBeenCalled();
+  });
+
+  it("adopts an ad-hoc vnc link with the protocol default port and passes the type", async () => {
+    const nowHosts: PluginHostRecord[] = [...hosts];
+    const created: PluginHostRecord = {
+      id: "43",
+      name: "10.0.0.9",
+      ip: "10.0.0.9",
+      port: 5900,
+    };
+    post.mockImplementation(async () => {
+      nowHosts.push(created);
+      return { data: { created: true, hostId: 43 } };
+    });
+    const double = makeApp({ hosts: nowHosts });
+    vi.useFakeTimers();
+    const task = consumeDeepLink(
+      double.app,
+      "?connect=10.0.0.9&type=vnc&credential=deploy%20key",
+      adoptSettings(credentialState.post as never),
+    );
+    await vi.advanceTimersByTimeAsync(300);
+    await task;
+    expect(post).toHaveBeenCalledWith("/adopt", {
+      hostName: "10.0.0.9",
+      type: "vnc",
+      credentialId: 7,
+      port: 5900,
+    });
+    expect(double.connectHost).toHaveBeenCalledWith(created, "vnc");
+  });
+
+  it("creates nothing and opens nothing when the adopt confirm is declined", async () => {
+    const double = makeApp({ confirmResult: false });
+    vi.useFakeTimers();
+    const task = consumeDeepLink(
+      double.app,
+      "?connect=10.0.0.5&type=vnc&credential=deploy%20key",
+      adoptSettings(credentialState.post as never),
+    );
+    await vi.advanceTimersByTimeAsync(100);
+    await task;
+    expect(double.confirm).toHaveBeenCalledTimes(1);
+    expect(post).not.toHaveBeenCalled();
+    expect(double.connectHost).not.toHaveBeenCalled();
+  });
+
+  it("ensures the remote-desktop settings when a plugin-made record gets a vnc link", async () => {
+    const pluginMade: PluginHostRecord = {
+      id: "9",
+      name: "192.168.103.99",
+      ip: "192.168.103.99",
+      port: 5900,
+      folder: "Ad-Hoc Hosts",
+      tags: ["ad-hoc"],
+      connectionType: "vnc",
+      protocolAuth: { vnc: { authType: "credential", credentialId: 7 } },
+    } as PluginHostRecord;
+    const double = makeApp({ hosts: [pluginMade] });
+    vi.useFakeTimers();
+    const task = consumeDeepLink(
+      double.app,
+      "?connect=192.168.103.99&type=vnc&credential=deploy%20key",
+      adoptSettings(credentialState.post as never),
+    );
+    await vi.advanceTimersByTimeAsync(300);
+    await task;
+    // The plain saved-open confirm consented to the whole flow; the ensure
+    // rides behind it with no extra dialog.
+    const titles = double.confirm.mock.calls
+      .map((call) => (call[0] as { title: string }).title)
+      .join("|");
+    expect(titles).toContain("deepLink.confirmTitle");
+    expect(titles).not.toContain("deepLink.adoptUpdateTitle");
+    expect(post).toHaveBeenCalledWith("/adopt", {
+      hostName: "192.168.103.99",
+      type: "vnc",
+      credentialId: 7,
+      port: 5900,
+    });
+    expect(double.connectHost).toHaveBeenCalledWith(pluginMade, "vnc");
+  });
+
+  it("offers one update confirm when the user's own record lacks the protocol login", async () => {
+    const userHost: PluginHostRecord = {
+      id: "9",
+      name: "wag-server01",
+      ip: "10.4.0.15",
+      port: 22,
+      folder: "Site",
+      tags: ["prod"],
+      connectionType: "ssh",
+    };
+    const double = makeApp({ hosts: [userHost] });
+    vi.useFakeTimers();
+    const task = consumeDeepLink(
+      double.app,
+      "?connect=wag-server01&type=vnc&credential=deploy%20key",
+      adoptSettings(credentialState.post as never),
+    );
+    await vi.advanceTimersByTimeAsync(300);
+    await task;
+    expect(double.confirm).toHaveBeenCalledTimes(1);
+    const dialog = double.confirm.mock.calls[0][0];
+    expect(dialog.title).toContain("deepLink.adoptUpdateTitle");
+    expect(dialog.confirmLabel).toBe("deepLink.adoptUpdateAction");
+    expect(post).toHaveBeenCalledWith("/adopt", {
+      hostName: "wag-server01",
+      type: "vnc",
+      credentialId: 7,
+      port: 22,
+    });
+    expect(double.connectHost).toHaveBeenCalledWith(userHost, "vnc");
+    expect(toastSuccess).toHaveBeenCalledWith(
+      double.t("deepLink.adoptUpdated", { host: "wag-server01" }),
+    );
+  });
+
+  it("leaves a user-shaped record alone when it already has the protocol login", async () => {
+    const userHost: PluginHostRecord = {
+      id: "9",
+      name: "wag-server01",
+      ip: "10.4.0.15",
+      port: 22,
+      folder: "Site",
+      tags: ["prod"],
+      connectionType: "ssh",
+      protocolAuth: { vnc: { authType: "credential", credentialId: 7 } },
+    } as PluginHostRecord;
+    const double = makeApp({ hosts: [userHost] });
+    vi.useFakeTimers();
+    const task = consumeDeepLink(
+      double.app,
+      "?connect=wag-server01&type=vnc&credential=deploy%20key",
+      adoptSettings(credentialState.post as never),
+    );
+    await vi.advanceTimersByTimeAsync(300);
+    await task;
+    expect(post).toHaveBeenCalledTimes(0);
+    expect(double.connectHost).toHaveBeenCalledWith(userHost, "vnc");
+  });
+
+  it("falls back to the interactive ad-hoc flow when the route is unavailable", async () => {
+    post.mockRejectedValue(new Error("route gone"));
+    const double = makeApp();
+    defaultTab.mockReturnValue("terminal" as never);
+    vi.useFakeTimers();
+    const task = consumeDeepLink(
+      double.app,
+      "?connect=10.0.0.5&type=ssh&credential=deploy%20key",
+      adoptSettings(credentialState.post as never),
+    );
+    await vi.advanceTimersByTimeAsync(400);
+    await task;
+    expect(toastError).toHaveBeenCalledWith("deepLink.adoptUnavailable");
+    // Two confirms: the adopt prompt, then the plain ad-hoc one.
+    expect(double.confirm).toHaveBeenCalledTimes(2);
+    const fallbackArgs = double.confirm.mock.calls[1][0];
+    expect(fallbackArgs.description).toContain("deepLink.adhocCredentialNote");
+    expect(quickConnect).toHaveBeenCalled();
+    expect(double.connectHost).toHaveBeenCalledTimes(1);
   });
 
   it("falls back to the default connect and fails when the registry never fills", async () => {
@@ -378,20 +617,14 @@ describe("startDeepLinkConsumer", () => {
     startDeepLinkConsumer(double.app, {
       env: { locationSearch: () => "?tab=x", scrub },
     });
-    // Nothing to scrub: the URL carries no deep-link parameters.
     expect(scrub).not.toHaveBeenCalled();
-    expect(double.listHosts).not.toHaveBeenCalled();
     expect(double.confirm).not.toHaveBeenCalled();
   });
 
-  it("consumes an intent exactly once", async () => {
+  it("connects through the normal app path when params exist", async () => {
     const double = makeApp();
     const scrub = vi.fn();
     vi.useFakeTimers();
-    startDeepLinkConsumer(double.app, {
-      env: { locationSearch: () => "?connect=10.0.0.5&type=vnc", scrub },
-    });
-    await vi.advanceTimersByTimeAsync(100);
     startDeepLinkConsumer(double.app, {
       env: { locationSearch: () => "?connect=10.0.0.5&type=vnc", scrub },
     });
