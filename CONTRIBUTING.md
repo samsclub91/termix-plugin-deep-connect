@@ -1,4 +1,4 @@
-# Contributing to Lansweeper Connector
+# Contributing to Deep Connect
 
 ## Development
 

@@ -19,7 +19,7 @@ import {
 import type { DeepLinkProtocol } from "./connect-plan";
 
 /**
- * A browser `?view=lansweeper-connect` page mounts ONLY this component, with
+ * A browser `?view=deep-connect` page mounts ONLY this component, with
  * no app shell: the shell's own callbacks are unbound there, so a plugin
  * cannot drive a styled confirm or connectHost from the standalone page at
  * all. The view is therefore a full-page hand-off: it keeps the deep-link

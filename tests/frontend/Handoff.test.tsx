@@ -45,7 +45,7 @@ let rendered: RenderedPluginApp | null = null;
 async function renderHandoff() {
   const testPlugin = {
     activate(app: TermixApp) {
-      app.registerTab("lansweeper-connect", StandaloneHandoff as never, {
+      app.registerTab("deep-connect", StandaloneHandoff as never, {
         titleKey: "tab.title",
         hostless: true,
         singleton: true,
@@ -56,7 +56,7 @@ async function renderHandoff() {
     manifest: manifestJson as never,
     locales,
   });
-  rendered.renderTab("lansweeper-connect", { view: "lansweeper-connect" });
+  rendered.renderTab("deep-connect", { view: "deep-connect" });
 }
 
 afterEach(async () => {
@@ -71,7 +71,7 @@ describe("handoffTarget", () => {
   it("keeps only the seven deep-link parameters, first-seen order, no view", () => {
     expect(
       handoffTarget(
-        "?view=lansweeper-connect&connect=H%201&type=rdp&domain=WAG&zzz=1&port=3390&using=name&credential=adm&viewonly=1",
+        "?view=deep-connect&connect=H%201&type=rdp&domain=WAG&zzz=1&port=3390&using=name&credential=adm&viewonly=1",
         "https://termix.example.com",
         "/",
       ),
@@ -87,7 +87,7 @@ describe("handoffTarget", () => {
 
 describe("StandaloneHandoff", () => {
   it("shows the empty state when the URL has no connect parameter", async () => {
-    window.history.replaceState(null, "", "/?view=lansweeper-connect");
+    window.history.replaceState(null, "", "/?view=deep-connect");
     await renderHandoff();
     expect(screen.getByText(locales.handoff.noPayload)).toBeTruthy();
     expect(screen.getByText(locales.tab.empty)).toBeTruthy();
@@ -98,7 +98,7 @@ describe("StandaloneHandoff", () => {
     window.history.replaceState(
       null,
       "",
-      "/?view=lansweeper-connect&connect=H1&type=rdp&domain=WAG&zzz=1",
+      "/?view=deep-connect&connect=H1&type=rdp&domain=WAG&zzz=1",
     );
     await renderHandoff();
     fireEvent.click(screen.getByText(locales.handoff.cancel));
@@ -110,7 +110,7 @@ describe("StandaloneHandoff", () => {
     window.history.replaceState(
       null,
       "",
-      "/?view=lansweeper-connect&connect=H1&type=rdp",
+      "/?view=deep-connect&connect=H1&type=rdp",
     );
     await renderHandoff();
     // A foreign navigation lands while the card is open; the cancel must
@@ -125,7 +125,7 @@ describe("StandaloneHandoff", () => {
     window.history.replaceState(
       null,
       "",
-      "/?view=lansweeper-connect&connect=10.0.0.5&type=rdp&using=adhoc",
+      "/?view=deep-connect&connect=10.0.0.5&type=rdp&using=adhoc",
     );
     listProtocols.mockReturnValue([] as never);
     await renderHandoff();
@@ -136,7 +136,7 @@ describe("StandaloneHandoff", () => {
     expect(screen.getByText(locales.handoff.noPlugin)).toBeTruthy();
     // No hand-off happened: the URL keeps its parameters for the card.
     expect(window.location.search).toBe(
-      "?view=lansweeper-connect&connect=10.0.0.5&type=rdp&using=adhoc",
+      "?view=deep-connect&connect=10.0.0.5&type=rdp&using=adhoc",
     );
   });
 
@@ -145,7 +145,7 @@ describe("StandaloneHandoff", () => {
     window.history.replaceState(
       null,
       "",
-      "/?view=lansweeper-connect&connect=10.0.0.5&type=rdp&using=adhoc",
+      "/?view=deep-connect&connect=10.0.0.5&type=rdp&using=adhoc",
     );
     listProtocols.mockReturnValue([{ id: "rdp", defaultPort: 3389 }] as never);
     await renderHandoff();

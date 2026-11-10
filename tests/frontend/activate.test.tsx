@@ -43,13 +43,13 @@ afterEach(async () => {
 describe(`${manifest.id} activate`, () => {
   it("registers the standalone tab and no rail item", async () => {
     rendered = await renderWithApp(plugin, { manifest, locales });
-    expect(rendered.registered.tabs()).toEqual(["lansweeper-connect"]);
+    expect(rendered.registered.tabs()).toEqual(["deep-connect"]);
     expect(rendered.registered.railItems()).toEqual([]);
   });
 
   it("renders the tab's empty state as a plain tab", async () => {
     rendered = await renderWithApp(plugin, { manifest, locales });
-    rendered.renderTab("lansweeper-connect", { isVisible: true });
+    rendered.renderTab("deep-connect", { isVisible: true });
     expect(await screen.findByText(locales.tab.empty)).toBeTruthy();
   });
 

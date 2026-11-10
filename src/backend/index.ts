@@ -1,7 +1,7 @@
 /**
  * Termix plugin backends load a backend entry even when the plugin only
  * contributes UI. This plugin registers one route family: the ad-hoc host
- * adoption route (POST /plugin-api/lansweeper-connector/adopt) used by the
+ * adoption route (POST /plugin-api/deep-connect/adopt) used by the
  * consumer when the user confirms creating a saved host from a deep link.
  */
 import type { PluginContext } from "@termix-ssh/plugin-sdk/backend";

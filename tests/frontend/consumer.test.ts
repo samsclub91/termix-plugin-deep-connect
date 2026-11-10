@@ -80,7 +80,7 @@ function makeApp(options?: {
   const confirm = vi.fn(async () => options?.confirmResult ?? true);
   const listHosts = vi.fn(async () => options?.hosts ?? hosts);
   const app = {
-    pluginId: "lansweeper-connector",
+    pluginId: "deep-connect",
     t,
     listHosts,
     confirm,
@@ -644,7 +644,7 @@ describe("startDeepLinkConsumer", () => {
     const scrub = vi.fn();
     startDeepLinkConsumer(double.app, {
       env: {
-        locationSearch: () => "?view=lansweeper-connect&connect=h1",
+        locationSearch: () => "?view=deep-connect&connect=h1",
         scrub,
       },
     });

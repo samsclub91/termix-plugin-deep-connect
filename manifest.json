@@ -1,15 +1,15 @@
 {
-  "id": "lansweeper-connector",
-  "name": "Lansweeper Connector",
-  "version": "1.1.0",
-  "description": "Opens Termix sessions from URLs (built for Lansweeper asset links): connects saved hosts or ad-hoc addresses over SSH, RDP or VNC, with a confirm before every connect.",
+  "id": "deep-connect",
+  "name": "Deep Connect",
+  "version": "1.2.0",
+  "description": "Opens Termix sessions from URLs (URI → session launcher): connects saved hosts or ad-hoc addresses over SSH, RDP or VNC, with a confirm before every connect.",
   "author": {
     "name": "Andrew Hancock",
     "url": "https://github.com/samsclub91"
   },
   "license": "Apache-2.0",
-  "repository": "https://github.com/samsclub91/termix-plugin-lansweeper-connector",
-  "docs": "https://github.com/samsclub91/termix-plugin-lansweeper-connector/tree/main/docs",
+  "repository": "https://github.com/samsclub91/termix-plugin-deep-connect",
+  "docs": "https://github.com/samsclub91/termix-plugin-deep-connect/tree/main/docs",
   "category": "Infrastructure",
   "icon": "Monitor",
   "features": [
@@ -33,7 +33,7 @@
   "contributes": {
     "tabs": [
       {
-        "id": "lansweeper-connect",
+        "id": "deep-connect",
         "titleKey": "tab.title",
         "icon": "Monitor",
         "openFrom": [

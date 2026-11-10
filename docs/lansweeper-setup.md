@@ -1,6 +1,6 @@
-# Use Lansweeper Connector from Lansweeper asset actions
+# Use Deep Connect from Lansweeper asset actions
 
-Lansweeper Connector turns a Lansweeper **asset action link** into a Termix session. On the
+Deep Connect turns a Lansweeper **asset action link** into a Termix session. On the
 Lansweeper side you configure the link once (per site or per action), and every asset can
 then start the right Termix session in one click.
 
@@ -19,25 +19,25 @@ version's syntax.
 **SSH (default connect — opens the host's default connection):**
 
 ```
-https://termix.example.com/?view=lansweeper-connect&connect={NAME}
+https://termix.example.com/?view=deep-connect&connect={NAME}
 ```
 
 **RDP to an address, with a named credential and an AD domain:**
 
 ```
-https://termix.example.com/?view=lansweeper-connect&connect={IPADDR}&type=rdp&credential=%5BCREED%5D&domain=WAG&using=adhoc
+https://termix.example.com/?view=deep-connect&connect={IPADDR}&type=rdp&credential=%5BCREED%5D&domain=WAG&using=adhoc
 ```
 
 **VNC to an address with a port override:**
 
 ```
-https://termix.example.com/?view=lansweeper-connect&connect={IPADDR}&type=vnc&credential=%5BVNC%5D&port=5900&using=adhoc
+https://termix.example.com/?view=deep-connect&connect={IPADDR}&type=vnc&credential=%5BVNC%5D&port=5900&using=adhoc
 ```
 
 **Saved host by address (no type — the host keeps its own log-in):**
 
 ```
-https://termix.example.com/?view=lansweeper-connect&connect={IPADDR}
+https://termix.example.com/?view=deep-connect&connect={IPADDR}
 ```
 
 ## Grammar

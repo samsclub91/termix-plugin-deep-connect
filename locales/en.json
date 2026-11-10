@@ -1,6 +1,6 @@
 {
   "plugin": {
-    "name": "Lansweeper Connector",
+    "name": "Deep Connect",
     "description": "Opens Termix sessions from URLs (built for Lansweeper asset links): connects saved hosts or ad-hoc addresses over SSH, RDP or VNC, with a confirm before every connect."
   },
   "tab": {
@@ -40,7 +40,7 @@
   },
   "permissions": {
     "use": {
-      "title": "Use Lansweeper Connector",
+      "title": "Use Deep Connect",
       "description": "Open Termix sessions from Lansweeper asset links."
     }
   }

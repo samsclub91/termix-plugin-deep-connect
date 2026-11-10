@@ -6,11 +6,11 @@ import {
 import { startDeepLinkConsumer } from "./consumer";
 import { StandaloneHandoff } from "./StandaloneHandoff";
 
-const TAB_ID = "lansweeper-connect";
+const TAB_ID = "deep-connect";
 
 /**
  * The palette-opened tab is deliberately a stub: the real entry points are
- * the standalone `?view=lansweeper-connect` page and the activate-time
+ * the standalone `?view=deep-connect` page and the activate-time
  * consumer, neither of which needs an interactive tab. If the shell ever
  * opens the type as a plain tab, it still shows a sensible empty state.
  */

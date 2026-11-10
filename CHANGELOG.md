@@ -1,9 +1,19 @@
 # Changelog
 
+## 1.2.0
+
+### Changed
+
+- Renamed from "Lansweeper Connector" to **Deep Connect** (plugin id `deep-connect`, repo `termix-plugin-deep-connect`): the plugin is a general URI → session launcher; Lansweeper is one consumer of it, documented in the setup guide
+- The standalone hand-off page is now `?view=deep-connect` (was `?view=lansweeper-connect`); the plain `?connect=…&type=…` links are unchanged
+- The adopt route moved to `/plugin-api/deep-connect/adopt`
+- Records already created in the Ad-Hoc Hosts folder keep working unchanged: they are ordinary saved hosts
+
 ## 1.1.0
 
 ### Fixed
 
+- Records the plugin creates (or ensures) check the remote-desktop `ignore certificate` box on RDP: machines on an AD fleet usually carry a self-signed cert, and a cert prompt would kill the click-through; an existing record self-heals the box on the next click of its RDP link
 - A cross-protocol link no longer inherits the record's primary-protocol port: the ensure that adds RDP to a VNC-created host wrote that host's VNC port (5900) as the RDP port, so RDP negotiated against the VNC server and died with "The RDP server sent something the engine could not handle" (credit: caught in production dogfooding); an omitted port now resolves the link protocol's default server-side, and the RDP link's AD domain rides the ensure the same way it rides the create
 - A VNC or RDP link that adopts a host now creates a record the link can actually use: the remote-desktop connect toggle lives in the host's `remote-desktop` plugin settings, which the first release never wrote, so adopted records connected over SSH instead (credit: caught in production dogfooding)
 - The intended protocol now opens DIRECTLY after an adoption or an ensure: `connectHost` reads the shell's host store, which can lag the write just made, and its fallback opened whichever session the store already knew (a VNC link silently opening the RDP record, or nothing at all) (credit: caught in production dogfooding)

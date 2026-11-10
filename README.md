@@ -1,6 +1,6 @@
-# Lansweeper Connector
+# Deep Connect
 
-Launch Termix sessions straight from [Lansweeper](https://www.lansweeper.com/) asset action
+Launch Termix sessions from deep links (URI → session launcher; built for Lansweeper asset actions)
 links. A link opens a Termix confirm dialog first; only after you accept it does a session
 start, with the deep-link details scrubbed from the URL.
 
@@ -28,7 +28,7 @@ list, resolves a credential by name, and hands the session to Termix's own conne
 
 1. Enable the community registry under **Plugins → Registries** (or load the `.tmxplug`
    from a GitHub release).
-2. Install **Lansweeper Connector** from the Plugins tab.
+2. Install **Deep Connect** from the Plugins tab.
 3. Use the **Connect from link** tab (or any Lansweeper link below).
 
 ## Link grammar
@@ -49,7 +49,7 @@ https://<termix>/?connect=<name|address>&type=<ssh|rdp|vnc>&credential=<name>&po
 
 For the canonical link shape that survives signed-out users and unknown parameters, open
 URL actions through the hand-off page:
-`?view=lansweeper-connect&…` — it keeps the seven deep-link parameters, drops the rest, and
+`?view=deep-connect&…` — it keeps the seven deep-link parameters, drops the rest, and
 relaunches the app at its root, where the consumer runs with the real shell. A raw
 `/?connect=…` link also works directly.
 

@@ -14,14 +14,14 @@ If the guide and the SDK's TypeScript types disagree, the types are right.
 
 ## What this plugin is
 
-`lansweeper-connector` launches Termix sessions from Lansweeper asset action links
+`deep-connect` launches Termix sessions from Lansweeper asset action links
 (`?connect=…` deep links). It has no backend surface — `src/backend/index.ts` is only the
 empty entry core requires of every plugin (no routes, tables, actions or secrets) — and no
 outbound network calls; capabilities are exactly `ui:surface`, `hosts:read`, `credentials:use`.
 
 ## Architecture (do not break these)
 
-- **Two entries, one consumer.** Link A is `?view=lansweeper-connect&…` on a browser: core
+- **Two entries, one consumer.** Link A is `?view=deep-connect&…` on a browser: core
   mounts ONLY this plugin's standalone component there, with no shell and unbound shell
   callbacks — `app.tabs.connectHost` and the styled `app.confirm` are silent no-ops on that
   page. That is why `StandaloneHandoff.tsx` is a full-page hand-off that relaunches the app
@@ -71,7 +71,7 @@ npm run format       # format with Prettier
 ## About this plugin
 
 - The plugin id is immutable after the first release; registry listing expects the repo
-  name `termix-plugin-lansweeper-connector` and the id `lansweeper-connector`.
+  name `termix-plugin-deep-connect` and the id `deep-connect`.
 - The consumer's settle window (hosts + protocol registries, ~4 s) deliberately falls
   through when nothing settles: a user with zero hosts still gets ad-hoc links, at the cost
   of a slow refusal toast when the registries never came up.
