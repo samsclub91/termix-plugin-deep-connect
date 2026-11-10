@@ -6,6 +6,7 @@ import {
 } from "@termix-ssh/plugin-sdk/ui";
 import { listCredentials } from "@termix-ssh/plugin-sdk/frontend";
 import type {
+  PluginApiClient,
   PluginCredentialSummary,
   PluginHostRecord,
   TermixApp,
@@ -13,6 +14,7 @@ import type {
 import { parseDeepLinkConnect, stripDeepLinkParams } from "./deep-link";
 import {
   resolveConnectPlan,
+  type AdoptRequest,
   type ConnectPlan,
   type DeepLinkProtocol,
 } from "./connect-plan";
@@ -46,6 +48,11 @@ export interface DeepLinkConsumerSettings {
     locationSearch?: () => string;
     scrub?: (cleaned: string) => void;
   };
+  /**
+   * The plugin API client (adopt POST). Injected for tests; defaults to
+   * the SDK bridge client for this plugin.
+   */
+  adoptApi?: () => PluginApiClient;
 }
 
 const DEFAULT_SETTLE_BUDGET_MS = 4000;
@@ -82,7 +89,7 @@ export async function consumeDeepLink(
       DeepLinkConsumerSettings,
       "settleBudgetMs" | "pollMs" | "defaultTabBudgetMs"
     >
-  >,
+  > & { adoptApi?: DeepLinkConsumerSettings["adoptApi"] },
 ): Promise<void> {
   const intent = parseDeepLinkConnect(search);
   if (!intent) return;
@@ -147,36 +154,177 @@ export async function consumeDeepLink(
 async function confirmAndConnect(
   app: TermixApp,
   plan: ConnectPlan,
-  settings: { pollMs: number; defaultTabBudgetMs: number },
+  settings: { pollMs: number; defaultTabBudgetMs: number; adoptApi?: DeepLinkConsumerSettings["adoptApi"] },
 ): Promise<void> {
   const t = app.t;
   const dialog = plan.dialog!;
-  const parts: string[] = [
-    t("deepLink.confirmDescription", { host: dialog.address }),
-  ];
-  if (dialog.saved && dialog.credential) {
-    parts.push(t("deepLink.credentialNote", { name: dialog.credential.name }));
+  const adopt = dialog.adopt;
+  if (adopt) {
+    const outcome = await confirmAdoptAndConnect(app, adopt, dialog, settings);
+    if (outcome === "handled") return;
+    // The create was unavailable (fallback): the ad-hoc quick connect under
+    // the plan still runs — the interactive session instead of the saved one.
+    // Surface the credential as not carried, same as plan v1 would.
+    if (dialog.credential && !dialog.credentialNotCarried) {
+      dialog.credentialNotCarried = {
+        name: dialog.credential.name,
+        protocol: adopt.type,
+      };
+    }
   }
-  if (dialog.credentialNotCarried) {
-    parts.push(
-      t("deepLink.adhocCredentialNote", {
-        name: dialog.credentialNotCarried.name,
-        protocol: (dialog.credentialNotCarried.protocol ?? "ssh") as string,
-      }),
-    );
-  }
-  if (dialog.viewOnly) {
-    parts.push(t("deepLink.viewOnlyNote"));
-  }
+  await connectResolvedPlan(app, plan, settings, /* confirmFirst */ true);
+}
+
+/**
+ * Adoption: the plan says this link can become a saved host in the
+ * "Ad-Hoc Hosts" folder (credential attached by id, never a secret), which
+ * lets the connect ride the supported saved-host path — real connections
+ * with server-side credential resolution instead of an interactive prompt.
+ */
+type AdoptOutcome = "handled" | "fallback";
+
+async function confirmAdoptAndConnect(
+  app: TermixApp,
+  adopt: AdoptRequest,
+  dialog: NonNullable<ConnectPlan["dialog"]>,
+  settings: { pollMs: number; defaultTabBudgetMs: number; adoptApi?: DeepLinkConsumerSettings["adoptApi"] },
+): Promise<AdoptOutcome> {
+  const t = app.t;
+  if (!dialog.credential) return "fallback";
+  // The app object the shell hands to activate carries a non-hook API client
+  // (usePluginApi() is a React hook and throws in module-scope code like
+  // this), so route POSTs go through `app.api`.
+  const api = (settings.adoptApi?.() ?? app.api) as
+    | PluginApiClient
+    | undefined;
+  if (!api || typeof api.post !== "function") return "fallback";
+
   const ok = await app.confirm({
-    title: t(dialog.saved ? "deepLink.confirmTitle" : "deepLink.adhocTitle", {
-      host: dialog.hostLabel,
+    title: t("deepLink.adoptTitle", { host: dialog.address }),
+    description: t("deepLink.adoptDescription", {
+      host: dialog.address,
+      name: dialog.credential.name,
     }),
-    description: parts.join(" "),
-    confirmLabel: t("deepLink.openAction"),
+    confirmLabel: t("deepLink.adoptAction"),
     destructive: false,
   });
-  if (!ok) return;
+  // Declined: the user said no — nothing opens, not even the ad-hoc fallback.
+  if (!ok) return "handled";
+
+  let createdHostId: number | null = null;
+  try {
+    const { data } = await api.post<{
+      created: boolean;
+      hostId: number;
+      reason?: string;
+    }>("/adopt", {
+      hostName: adopt.hostName,
+      type: adopt.type,
+      credentialId: adopt.credentialId,
+      port: adopt.port,
+      ...(adopt.domain ? { domain: adopt.domain } : {}),
+    });
+    createdHostId = data.hostId ?? null;
+  } catch {
+    // No adopt route (older core) or refused: note it and keep the ad-hoc
+    // fallback instead of dying silently.
+    toast.error(t("deepLink.adoptUnavailable"));
+    return "fallback";
+  }
+  if (createdHostId === null) return "fallback";
+
+  // The saved host now exists; find it and connect through the saved flow
+  // (server-side credential expansion — the secret never leaves Termix). The
+  // list can lag a few seconds behind the write, so poll long enough for the
+  // row to surface, and if it still is not listable, connect against the
+  // record shape we wrote — every field comes from the adopt request itself.
+  const created = await (async () => {
+    for (let attempt = 0; attempt < 10; attempt++) {
+      try {
+        const rows = await app.listHosts();
+        const found = (Array.isArray(rows) ? rows : []).find(
+          (row) => String(row.id) === String(createdHostId),
+        );
+        if (found) return found;
+      } catch {
+        // list can lag one settle behind; retry briefly.
+      }
+      await sleep(300);
+    }
+    return undefined;
+  })();
+  const hostToConnect: PluginHostRecord =
+    created ??
+    ({
+      id: String(createdHostId),
+      name: adopt.hostName,
+      ip: adopt.hostName,
+      port: adopt.port,
+      connectionType: adopt.type,
+    } as PluginHostRecord);
+  toast.success(t("deepLink.adoptCreated", { host: adopt.hostName }));
+
+  // The created record is fully known (we wrote the rows), so its default
+  // connection is deterministic: SSH adopts the terminal directly instead of
+  // polling the host-action registry, which can still be filling for a
+  // freshly created record when the connect hands off.
+  const savedPlan: ConnectPlan = {
+    status: "saved",
+    host: hostToConnect,
+    typeToPass: adopt.type === "ssh" ? "terminal" : adopt.type,
+    dialog: {
+      saved: true,
+      hostLabel: hostToConnect.name ?? adopt.hostName,
+      address: hostToConnect.ip,
+      credential: dialog.credential,
+      viewOnly: dialog.viewOnly,
+    },
+  };
+  await connectResolvedPlan(app, savedPlan, settings, /* confirmFirst */ false);
+  return "handled";
+}
+
+/**
+ * Presents the plan's confirm dialog (skippable — adoption already got one)
+ * and opens the session. The shared tail of both the ad-hoc and the saved
+ * flow; failures surface as toasts, never silent voids.
+ */
+async function connectResolvedPlan(
+  app: TermixApp,
+  plan: ConnectPlan,
+  settings: { pollMs: number; defaultTabBudgetMs: number },
+  confirmFirst: boolean,
+): Promise<void> {
+  const t = app.t;
+  const dialog = plan.dialog!;
+  if (confirmFirst) {
+    const parts: string[] = [
+      t("deepLink.confirmDescription", { host: dialog.address }),
+    ];
+    if (dialog.saved && dialog.credential) {
+      parts.push(t("deepLink.credentialNote", { name: dialog.credential.name }));
+    }
+    if (dialog.credentialNotCarried) {
+      parts.push(
+        t("deepLink.adhocCredentialNote", {
+          name: dialog.credentialNotCarried.name,
+          protocol: (dialog.credentialNotCarried.protocol ?? "ssh") as string,
+        }),
+      );
+    }
+    if (dialog.viewOnly) {
+      parts.push(t("deepLink.viewOnlyNote"));
+    }
+    const ok = await app.confirm({
+      title: t(dialog.saved ? "deepLink.confirmTitle" : "deepLink.adhocTitle", {
+        host: dialog.hostLabel,
+      }),
+      description: parts.join(" "),
+      confirmLabel: t("deepLink.openAction"),
+      destructive: false,
+    });
+    if (!ok) return;
+  }
 
   const host = plan.host! as Parameters<typeof app.tabs.connectHost>[0];
   // Pass the type through only for REGISTERED plugin protocols (rdp, vnc,
@@ -239,6 +387,7 @@ export function startDeepLinkConsumer(
     settleBudgetMs: options.settleBudgetMs ?? DEFAULT_SETTLE_BUDGET_MS,
     pollMs: options.pollMs ?? DEFAULT_POLL_MS,
     defaultTabBudgetMs: options.defaultTabBudgetMs ?? DEFAULT_TAB_BUDGET_MS,
+    adoptApi: options.adoptApi,
   });
 }
 
