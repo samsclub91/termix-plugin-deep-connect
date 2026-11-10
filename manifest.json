@@ -19,17 +19,23 @@
     "Every connect shows a confirm dialog first; links never carry secrets"
   ],
   "engine": {
-    "termix": ">=26.11.1-0",
+    "termix": ">=26.11.0-0",
     "api": "^1.13"
   },
-  "capabilities": ["ui:surface", "hosts:read", "credentials:use"],
+  "capabilities": [
+    "ui:surface",
+    "hosts:read",
+    "credentials:use"
+  ],
   "contributes": {
     "tabs": [
       {
         "id": "lansweeper-connect",
         "titleKey": "tab.title",
         "icon": "Monitor",
-        "openFrom": ["palette"]
+        "openFrom": [
+          "palette"
+        ]
       }
     ],
     "permissions": [
@@ -37,10 +43,17 @@
         "name": "use",
         "titleKey": "permissions.use.title",
         "descriptionKey": "permissions.use.description",
-        "defaultRoles": ["admin", "user"]
+        "defaultRoles": [
+          "admin",
+          "user"
+        ]
       }
     ]
   },
   "locales": "locales",
-  "platforms": ["linux", "win32", "darwin"]
+  "platforms": [
+    "linux",
+    "win32",
+    "darwin"
+  ]
 }
