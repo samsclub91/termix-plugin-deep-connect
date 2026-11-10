@@ -1,0 +1,37 @@
+{
+  "plugin": {
+    "name": "Lansweeper Connector",
+    "description": "Opens Termix sessions from Lansweeper asset links: connects saved hosts or ad-hoc addresses over SSH, RDP or VNC, with a confirm before every connect."
+  },
+  "tab": {
+    "title": "Connect from link",
+    "empty": "Paste a Lansweeper connect link in your browser to use this view."
+  },
+  "handoff": {
+    "opening": "Opening Termix",
+    "go": "Open in Termix",
+    "cancel": "Cancel",
+    "cancelled": "Connect cancelled. The link was cleared.",
+    "noPayload": "No connect link in this URL.",
+    "noPlugin": "This link asks for a connection type no plugin provides."
+  },
+  "deepLink": {
+    "confirmTitle": "Open {{host}}?",
+    "adhocTitle": "Connect to {{host}}?",
+    "confirmDescription": "A session for {{host}} opens in a new tab.",
+    "credentialNote": "Using credential {{name}}.",
+    "adhocCredentialNote": "{{name}} will be asked for in the session (saved credentials cannot be carried on ad-hoc {{protocol}} links yet).",
+    "viewOnlyNote": "The link asks for view only; Termix opens it normally in this version.",
+    "openAction": "Open session",
+    "hostNotFound": "No saved host matches {{host}}.",
+    "typeUnknown": "No plugin provides a {{type}} connection.",
+    "credentialNotFound": "No saved credential named {{name}}.",
+    "connectFailed": "No connection could be opened for this link."
+  },
+  "permissions": {
+    "use": {
+      "title": "Use Lansweeper Connector",
+      "description": "Open Termix sessions from Lansweeper asset links."
+    }
+  }
+}
