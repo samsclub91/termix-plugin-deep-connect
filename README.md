@@ -63,24 +63,37 @@ relaunches the app at its root, where the consumer runs with the real shell. A r
 - `src/frontend/StandaloneHandoff.tsx` — the full-page hand-off for `?view=` links.
 - `src/frontend/index.tsx` — activation: the tab registration and the consumer.
 
-## Honest limitations (v1)
+## Honest limitations (v1.1)
 
-- **Ad-hoc RDP/VNC with `credential=`**: the plugin cannot obtain the credential's secret.
-  The SDK only redacts credential summaries, and remote-desktop's quick-connect login has
-  no credential-id support yet. The username and AD domain are carried; the password
-  prompt comes from remote-desktop itself, and the confirm dialog says so.
-- **Ad-hoc SSH with `credential=`**: the username is carried, but the stored password or
-  key cannot be inlined by a plugin (core's own deep-link path can; a plugin's SDK cannot)
-  and an id-less quick-connect host cannot expand a stored credential server-side. The
-  session stops at Termix's own SSH auth prompt instead, and the confirm dialog says so.
-  Saved hosts are unaffected — their own log-ins always connect.
-- **Key-type credentials on ad-hoc links** behave like the SSH case above: they resolve by
-  name and surface in the confirm text, but the private key stays in Termix.
+- **Ad-hoc RDP/VNC with `credential=`**: the plugin itself still cannot obtain a credential's
+  secret. The SDK only redacts credential summaries, and remote-desktop's quick-connect login has
+  no credential-id support yet. What this plugin can do is offer, on the link's confirm, to create
+  a saved host in the **Ad-Hoc Hosts** folder with the credential attached by id (created through
+  the plugin backend, which sees ids only), and then connect through the saved-host flow — where
+  Termix expands the credential server-side and the session opens for real. Decline or an
+  unavailable route, and the v1 behavior takes over: carried username/domain, remote-desktop's own
+  password prompt. The adopt route declares `hosts:write` (the record create) and
+  `network:serve` (it is an authenticated plugin API route); it reads nothing secret.
+- **Ad-hoc SSH with `credential=`**: same story. Adoption makes it a real log-in through the saved
+  flow; in the fallback the username is carried and the session stops at Termix's own SSH auth
+  prompt (a plugin's SDK cannot inline a secret — core's own deep-link path can).
+- **Key-type credentials** work the same as password ones through adoption (the credential rides
+  by id and Termix applies the key server-side); in the fallback they resolve by name and surface
+  in the confirm text, but the private key stays in Termix.
 - **`viewonly=1`** is not applied; a host's own read-only setting still applies where Termix
   provides one.
 - A link with no saved match and no type is refused; an ad-hoc link whose type no registered
   plugin provides is refused with a toast (and the `?view=` page refuses it before handing
   off, when the registry has settled).
+- Created hosts carry a generic `ad-hoc` tag and a dated note, in the `Ad-Hoc Hosts` folder. The
+  plugin never deletes records; clear the folder yourself whenever you want.
+
+# Positioning
+
+The link grammar is source-agnostic — any web page, bookmark or asset-manager action that can
+open a URL can drive it. Lansweeper is the featured consumer (its URL actions are why this
+exists), but nothing in the plugin is Lansweeper-specific: created records, folder and tags are
+deliberately unbranded.
 
 ## Development
 
