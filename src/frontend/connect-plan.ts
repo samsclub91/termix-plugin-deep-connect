@@ -54,8 +54,20 @@ export type QuickConnectBuilder = (input: {
   domain?: string;
 }) => QuickConnectRecord;
 
+/** Connection types the adopt route can create a record for. */
+export const ADOPTABLE_TYPES = new Set(["ssh", "vnc", "rdp"]);
+
 export type ConnectPlanStatus =
   "saved" | "adhoc" | "hostNotFound" | "typeUnknown" | "credentialNotFound";
+
+/** What the consumer should ask the plugin backend to create, on confirm. */
+export interface AdoptRequest {
+  hostName: string;
+  type: string;
+  credentialId: number;
+  port: number;
+  domain?: string;
+}
 
 /** The dialog text pieces the shell consumer needs to present the plan. */
 export interface ConnectPlanDialog {
@@ -72,8 +84,17 @@ export interface ConnectPlanDialog {
     username?: string;
     authType?: string;
   };
+  /**
+   * Set when creating a saved host for this link (with the credential
+   * attached by id) would let the session carry the credential server-side.
+   * The consumer offers the create-confirm first; `host` below stays the
+   * ad-hoc fallback if the create does not happen.
+   */
+  adopt?: AdoptRequest;
   /** Set when a asked-for credential could not ride the session (ad-hoc). */
   credentialNotCarried?: { name: string; protocol?: string };
+  /** The session rides the host's saved protocol login, not the link's. */
+  protocolSaved?: boolean;
   /** The link asked for observe-only (viewonly=1). Parsed, not applied. */
   viewOnly?: boolean;
 }
@@ -97,6 +118,12 @@ export interface ConnectPlan {
  * - Saved hosts keep their own log-in. A `credential=` name is verified
  *   against the user's credential list and surfaced in the confirm text, but
  *   the host record is never rewritten.
+ * - Ad-hoc links WITH a credential and an adoptable type are adoption
+ *   candidates: the plan says so (`adopt`), and the consumer offers to
+ *   create the host in the "Ad-Hoc Hosts" folder so the credential rides
+ *   server-side. The quick-connect record is still built and kept in the
+ *   plan — it is the fallback when the confirm is declined or the route is
+ *   unavailable (older core), exactly the v1 behavior.
  * - Ad-hoc SSH carries a resolved credential's username; the password/key
  *   cannot ride (plugins get redacted summaries, and an id-less quick-connect
  *   host cannot expand a stored credential server-side), so the session
@@ -195,6 +222,33 @@ export function resolveConnectPlan(options: {
     ...(host as Record<string, unknown>),
     connectionType: coreSsh ? "ssh" : protocol!.id,
   } as QuickConnectRecord;
+
+  const typeForAdopt = coreSsh ? "ssh" : protocol!.id;
+  if (credential && ADOPTABLE_TYPES.has(typeForAdopt)) {
+    // Adoption candidate: the consumer offers to create the saved host so
+    // the credential rides server-side; the built quick connect is the
+    // fallback when the create is declined or unavailable.
+    return {
+      status: "adhoc",
+      host,
+      typeToPass: protocol ? protocol.id : undefined,
+      dialog: {
+        saved: false,
+        hostLabel: username ? `${username}@${address}` : address,
+        address,
+        credential,
+        adopt: {
+          hostName: address,
+          type: typeForAdopt,
+          credentialId: credential.id,
+          port: intent.port ??
+            (coreSsh ? 22 : (protocol as DeepLinkProtocol).defaultPort),
+          ...(intent.domain ? { domain: intent.domain } : {}),
+        },
+        viewOnly: intent.viewOnly,
+      },
+    };
+  }
 
   return {
     status: "adhoc",
