@@ -40,6 +40,13 @@ export interface DeepLinkConnectIntent {
   viewOnly?: boolean;
 }
 
+/**
+ * The `?view=` value that opens the standalone page: core's
+ * `standaloneViewFor` matches a registered tab type by this id, so the
+ * `?view=` name and the registered tab id are the same string by design.
+ */
+export const STANDALONE_VIEW_ID = "deep-connect";
+
 /** Every query parameter the deep-link connector claims on a URL. */
 export const DEEP_LINK_PARAMS = [
   "connect",

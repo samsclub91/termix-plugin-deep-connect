@@ -9,11 +9,17 @@
   },
   "handoff": {
     "opening": "Opening Termix",
-    "go": "Open in Termix",
+    "go": "Connect",
     "cancel": "Cancel",
     "cancelled": "Connect cancelled. The link was cleared.",
     "noPayload": "No connect link in this URL.",
-    "noPlugin": "This link asks for a connection type no plugin provides."
+    "noPlugin": "This link asks for a connection type no plugin provides.",
+    "typeNote": "Connection type: {{type}}.",
+    "adoptNote": "If {{host}} is a new address, this also saves it in the Ad-Hoc Hosts folder with credential {{name}} referenced, so the link keeps working.",
+    "fallbackNote": "A new tab opened for this link — finish the connect there. This view will not open another window.",
+    "sessionOpened": "Session opened.",
+    "sessionOpenedHint": "Switch to the Termix app: the session opened in its tabs.",
+    "connectFailedHint": "Nothing was opened and no new window will be launched. Try the link again, or connect from the Termix app."
   },
   "deepLink": {
     "confirmTitle": "Open {{host}}?",

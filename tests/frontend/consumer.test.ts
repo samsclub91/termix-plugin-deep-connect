@@ -26,6 +26,7 @@ const credentialState = vi.hoisted(() => ({
 
 vi.mock("@termix-ssh/plugin-sdk/frontend", () => ({
   listCredentials: vi.fn(async () => credentialState.credentials),
+  notifyHostsChanged: vi.fn(),
 }));
 
 // Deliberately NOT exporting usePluginApi from this mock: without an injected
@@ -33,18 +34,21 @@ vi.mock("@termix-ssh/plugin-sdk/frontend", () => ({
 // mocks exercise exactly that.
 import { toast } from "sonner";
 import * as ui from "@termix-ssh/plugin-sdk/ui";
-import type {
-  PluginApiClient,
-  PluginCredentialSummary,
-  PluginHostRecord,
-  TermixApp,
+import {
+  notifyHostsChanged as sdkNotify,
+  type PluginApiClient,
+  type PluginCredentialSummary,
+  type PluginHostRecord,
+  type TermixApp,
 } from "@termix-ssh/plugin-sdk/frontend";
 import {
   consumeDeepLink,
   resetDeepLinkConsumerForTests,
+  runConnectIntentSilently,
   startDeepLinkConsumer,
   startTermixLinkConsumer,
 } from "../../src/frontend/consumer";
+import { parseDeepLinkConnect } from "../../src/frontend/deep-link";
 
 const listProtocols = vi.mocked(ui.listHostProtocols);
 const defaultTab = vi.mocked(ui.getDefaultConnectionTab);
@@ -788,6 +792,213 @@ describe("startDeepLinkConsumer", () => {
     await vi.advanceTimersByTimeAsync(100);
     expect(double.confirm).toHaveBeenCalledTimes(1);
     expect(double.connectHost).toHaveBeenCalledTimes(1);
+  });
+
+  it("no-ops when the page has no search string at all (in-frame)", () => {
+    const double = makeApp();
+    const scrub = vi.fn();
+    startDeepLinkConsumer(double.app, {
+      env: { locationSearch: () => "", scrub },
+    });
+    // A sandboxed frame's location carries no search and the shell forwards
+    // none: nothing consumes, nothing scrubs — the standalone ?view= page
+    // owns web consumption.
+    expect(scrub).not.toHaveBeenCalled();
+    expect(listProtocols).not.toHaveBeenCalled();
+    expect(toastError).not.toHaveBeenCalled();
+    expect(double.confirm).not.toHaveBeenCalled();
+  });
+});
+
+describe("runConnectIntentSilently", () => {
+  it("connects a saved host straight through connectHost, no dialog", async () => {
+    const double = makeApp();
+    const outcome = await runConnectIntentSilently(
+      double.app,
+      parseDeepLinkConnect("?connect=Web%20Server%201")!,
+      SETTINGS,
+    );
+    expect(outcome).toBe("opened");
+    expect(double.connectHost).toHaveBeenCalledTimes(1);
+    expect(double.connectHost).toHaveBeenCalledWith(hosts[0], undefined);
+    expect(double.confirm).not.toHaveBeenCalled();
+    expect(toastError).not.toHaveBeenCalled();
+    expect(double.openTab).not.toHaveBeenCalled();
+  });
+
+  it("passes the link's protocol as the connect type for a saved host", async () => {
+    const double = makeApp();
+    const outcome = await runConnectIntentSilently(
+      double.app,
+      parseDeepLinkConnect("?connect=Web%20Server%201&type=vnc")!,
+      SETTINGS,
+    );
+    expect(outcome).toBe("opened");
+    expect(double.connectHost).toHaveBeenCalledWith(hosts[0], "vnc");
+  });
+
+  it("reports failure (with a toast) for an unresolved host, no retries", async () => {
+    const double = makeApp({ hosts: [] });
+    vi.useFakeTimers();
+    const run = runConnectIntentSilently(
+      double.app,
+      parseDeepLinkConnect("?connect=Ghost&using=name")!,
+      SETTINGS,
+    );
+    await vi.advanceTimersByTimeAsync(600);
+    const outcome = await run;
+    vi.useRealTimers();
+    expect(outcome).toBe("failed");
+    expect(toastError).toHaveBeenCalledWith(
+      expect.stringContaining("hostNotFound"),
+    );
+    expect(double.connectHost).not.toHaveBeenCalled();
+    expect(double.confirm).not.toHaveBeenCalled();
+  });
+
+  it("reports failure for a credential name that does not resolve", async () => {
+    credentialState.credentials = [];
+    const double = makeApp();
+    const outcome = await runConnectIntentSilently(
+      double.app,
+      parseDeepLinkConnect(
+        "?connect=10.0.0.5&type=vnc&credential=Nope&using=adhoc",
+      )!,
+      SETTINGS,
+    );
+    expect(outcome).toBe("failed");
+    expect(toastError).toHaveBeenCalledWith(
+      expect.stringContaining("credentialNotFound"),
+    );
+    expect(post).not.toHaveBeenCalled();
+  });
+
+  it("adopts a credentialed ad-hoc link and opens the protocol tab on the new id", async () => {
+    const created: PluginHostRecord = {
+      id: "42",
+      name: "10.0.0.5",
+      ip: "10.0.0.5",
+      port: 5900,
+      connectionType: "vnc",
+    };
+    const double = makeApp({ hosts: [created] });
+    const outcome = await runConnectIntentSilently(
+      double.app,
+      parseDeepLinkConnect(
+        "?connect=10.0.0.5&type=vnc&credential=Deploy%20Key&using=adhoc",
+      )!,
+      { ...SETTINGS, adoptApi: () => ({ post }) as unknown as PluginApiClient },
+    );
+    expect(outcome).toBe("opened");
+    expect(post).toHaveBeenCalledTimes(1);
+    expect(post).toHaveBeenCalledWith("/adopt", {
+      hostName: "10.0.0.5",
+      type: "vnc",
+      credentialId: 7,
+      port: 5900,
+    });
+    expect(sdkNotify).toHaveBeenCalledTimes(1);
+    expect(toastSuccess).toHaveBeenCalledWith(
+      expect.stringContaining("adoptCreated"),
+    );
+    expect(double.openTab).toHaveBeenCalledTimes(1);
+    expect(double.openTab).toHaveBeenCalledWith(created, "vnc");
+    expect(double.connectHost).not.toHaveBeenCalled();
+    expect(double.confirm).not.toHaveBeenCalled();
+  });
+
+  it("opens the terminal hand-off when an ssh link adopts", async () => {
+    const created: PluginHostRecord = {
+      id: "42",
+      name: "10.0.0.5",
+      ip: "10.0.0.5",
+      port: 22,
+    };
+    const double = makeApp({ hosts: [created] });
+    const outcome = await runConnectIntentSilently(
+      double.app,
+      parseDeepLinkConnect(
+        "?connect=10.0.0.5&credential=Deploy%20Key&using=adhoc",
+      )!,
+      { ...SETTINGS, adoptApi: () => ({ post }) as unknown as PluginApiClient },
+    );
+    expect(outcome).toBe("opened");
+    expect(post).toHaveBeenCalledWith("/adopt", {
+      hostName: "10.0.0.5",
+      type: "ssh",
+      credentialId: 7,
+      port: 22,
+    });
+    expect(double.openTab).not.toHaveBeenCalled();
+    expect(double.connectHost).toHaveBeenCalledWith(created, "terminal");
+  });
+
+  it("cannot open a credential-less ad-hoc link from a view", async () => {
+    const double = makeApp();
+    const outcome = await runConnectIntentSilently(
+      double.app,
+      parseDeepLinkConnect("?connect=10.0.0.5&type=vnc&using=adhoc")!,
+      SETTINGS,
+    );
+    expect(outcome).toBe("unavailable");
+    expect(post).not.toHaveBeenCalled();
+    expect(double.openTab).not.toHaveBeenCalled();
+    expect(double.connectHost).not.toHaveBeenCalled();
+  });
+
+  it("is unavailable when the app surface cannot act", async () => {
+    const double = makeApp();
+    // No usable app at all (a stubbed or unbridged holder entry).
+    expect(
+      await runConnectIntentSilently(
+        null as unknown as TermixApp,
+        parseDeepLinkConnect("?connect=Web%20Server%201")!,
+        SETTINGS,
+      ),
+    ).toBe("unavailable");
+    // An app without a tabs surface.
+    const bareApp = { listHosts: double.listHosts } as unknown as TermixApp;
+    expect(
+      await runConnectIntentSilently(
+        bareApp,
+        parseDeepLinkConnect("?connect=Web%20Server%201")!,
+        SETTINGS,
+      ),
+    ).toBe("unavailable");
+    expect(double.connectHost).not.toHaveBeenCalled();
+  });
+
+  it("is unavailable when the adopt route refuses and the open leg throws", async () => {
+    const double = makeApp({ hosts: [] });
+    // Route failure:
+    post.mockRejectedValueOnce(new Error("404"));
+    const failed = await runConnectIntentSilently(
+      double.app,
+      parseDeepLinkConnect(
+        "?connect=10.0.0.5&type=vnc&credential=Deploy%20Key&using=adhoc",
+      )!,
+      { ...SETTINGS, adoptApi: () => ({ post }) as unknown as PluginApiClient },
+    );
+    expect(failed).toBe("unavailable");
+    // Open-leg failure: the row exists on the list but tabs refuse.
+    const throwing = makeApp({
+      hosts: [{ id: "42", name: "10.0.0.5" } as PluginHostRecord],
+    });
+    throwing.openTab.mockImplementationOnce(() => {
+      throw new Error("bridge refused");
+    });
+    const legFailed = await runConnectIntentSilently(
+      throwing.app,
+      parseDeepLinkConnect(
+        "?connect=10.0.0.5&type=vnc&credential=Deploy%20Key&using=adhoc",
+      )!,
+      {
+        ...SETTINGS,
+        adoptApi: () => ({ post }) as unknown as PluginApiClient,
+      },
+    );
+    expect(legFailed).toBe("unavailable");
+    vi.useRealTimers();
   });
 });
 

@@ -4,7 +4,10 @@ import {
   getDefaultConnectionTab,
   listHostProtocols,
 } from "@termix-ssh/plugin-sdk/ui";
-import { listCredentials } from "@termix-ssh/plugin-sdk/frontend";
+import {
+  listCredentials,
+  notifyHostsChanged as sdkNotifyHostsChanged,
+} from "@termix-ssh/plugin-sdk/frontend";
 import type {
   PluginApiClient,
   PluginCredentialSummary,
@@ -116,6 +119,32 @@ function shellReady(app: TermixApp): Promise<void> {
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
+ * Waits (up to ~3s) for a freshly written host row to show up in the live
+ * host list, which can lag the write by a settle. Shared by the adopt-then-
+ * connect tail of the shell consumer and the standalone view's silent
+ * runner. Caller connects against the adopt request's own shape when this
+ * comes back undefined.
+ */
+async function pollCreatedHost(
+  app: TermixApp,
+  createdHostId: number,
+): Promise<PluginHostRecord | undefined> {
+  for (let attempt = 0; attempt < 10; attempt++) {
+    try {
+      const rows = await app.listHosts();
+      const found = (Array.isArray(rows) ? rows : []).find(
+        (row) => String(row.id) === String(createdHostId),
+      );
+      if (found) return found;
+    } catch {
+      // list can lag one settle behind; retry briefly.
+    }
+    await sleep(300);
+  }
+  return undefined;
+}
+
+/**
  * Runs the full consume pipeline for one parsed browser search string once
  * the shell is ready and the registries settled. Kept as the search-string
  * entry the tests drive: parse, then the shared intent runner.
@@ -140,18 +169,25 @@ export async function consumeDeepLink(
   });
 }
 
+/** Hosts, credentials and protocols an intent resolves against, settled. */
+interface PlanContext {
+  hosts: PluginHostRecord[];
+  credentials: PluginCredentialSummary[];
+  protocols: DeepLinkProtocol[];
+}
+
 /**
- * Runs the full consume pipeline for one parsed intent once the shell is
- * ready and the registries settled. Shared by the browser search consumer
- * and the desktop termix:// link consumer. Exported only for tests.
+ * Settles the context an intent resolves against: shell readiness plus the
+ * host list and the host-protocol registry. Both registries fill shortly
+ * after the plugin runtime starts, within the settle budget below.
+ * Shared by the browser search consumer, the desktop termix:// consumer and
+ * the standalone view's silent connect runner.
  */
-export async function runConnectIntent(
+async function settlePlanContext(
   app: TermixApp,
   intent: DeepLinkConnectIntent,
   settings: ResolvedSettings,
-): Promise<void> {
-  const t = app.t;
-
+): Promise<PlanContext> {
   await shellReady(app);
 
   // Settle: a host row plus at least one registered protocol. Both registries
@@ -183,6 +219,26 @@ export async function runConnectIntent(
       credentials = [];
     }
   }
+  return { hosts, credentials, protocols };
+}
+
+/**
+ * Runs the full consume pipeline for one parsed intent once the shell is
+ * ready and the registries settled. Shared by the browser search consumer
+ * and the desktop termix:// link consumer. Exported only for tests.
+ */
+export async function runConnectIntent(
+  app: TermixApp,
+  intent: DeepLinkConnectIntent,
+  settings: ResolvedSettings,
+): Promise<void> {
+  const t = app.t;
+
+  const { hosts, credentials, protocols } = await settlePlanContext(
+    app,
+    intent,
+    settings,
+  );
 
   const plan = resolveConnectPlan({
     intent,
@@ -210,20 +266,30 @@ export async function runConnectIntent(
 
 /**
  * The shell's host store refreshes only on these window events (its own
- * create/edit flows dispatch them; a plugin-side write reaches it through
- * none). A tab opened right after an adoption or an ensure reads that store
- * (GuacamoleApp's useHost), so without the event it races a stale store and
- * can give up with "host not found". Two names because the shell listens for
- * both.
+ * create/edit flows dispatch them; a plugin-side create/update broadcast
+ * reaches it through none of them from the plugin's own document). On core
+ * 26.11.3 a plugin frontend usually runs in a sandboxed frame whose window
+ * is NOT the shell's window — there the SDK's `notifyHostsChanged()` (the
+ * bridge calls `hosts.changed` host-side, and core dispatches the same
+ * event on the shell's window and reloads the host list) is the call that
+ * actually reaches the store. Both paths run; each is a no-op where it
+ * does not apply.
  */
 function notifyShellHostsChanged(): void {
-  if (typeof window === "undefined") return;
-  for (const name of ["termix:hosts-changed", "ssh-hosts:changed"]) {
-    try {
-      window.dispatchEvent(new CustomEvent(name));
-    } catch {
-      // A stub env without CustomEvent; nothing to do — the plain flow runs.
+  if (typeof window !== "undefined") {
+    for (const name of ["termix:hosts-changed", "ssh-hosts:changed"]) {
+      try {
+        window.dispatchEvent(new CustomEvent(name));
+      } catch {
+        // A stub env without CustomEvent; nothing to do — the plain flow runs.
+      }
     }
+  }
+  try {
+    sdkNotifyHostsChanged();
+  } catch {
+    // An unbridged SDK host: the window events above still work when this
+    // code runs inside the shell's own document.
   }
 }
 
@@ -456,21 +522,7 @@ async function confirmAdoptAndConnect(
   // list can lag a few seconds behind the write, so poll long enough for the
   // row to surface, and if it still is not listable, connect against the
   // record shape we wrote — every field comes from the adopt request itself.
-  const created = await (async () => {
-    for (let attempt = 0; attempt < 10; attempt++) {
-      try {
-        const rows = await app.listHosts();
-        const found = (Array.isArray(rows) ? rows : []).find(
-          (row) => String(row.id) === String(createdHostId),
-        );
-        if (found) return found;
-      } catch {
-        // list can lag one settle behind; retry briefly.
-      }
-      await sleep(300);
-    }
-    return undefined;
-  })();
+  const created = await pollCreatedHost(app, createdHostId);
   const hostToConnect: PluginHostRecord =
     created ??
     ({
@@ -594,10 +646,158 @@ async function connectResolvedPlan(
 }
 
 /**
+ * What the standalone view's in-frame connect attempt concluded:
+ *  - "opened": a session was dispatched (the saved-host connect or the
+ *    adopt-then-connect path completed without a local error),
+ *  - "failed": the link cannot open anything (unresolved host/type/
+ *    credential) — the toast is shown, and a new tab would only repeat it,
+ *  - "unavailable": the app surface cannot act from here (missing bridge,
+ *    thrown call, or an ad-hoc link that has no path to a real host id) —
+ *    the hand-off falls back to its new-tab entry.
+ */
+export type ViewConnectOutcome = "opened" | "failed" | "unavailable";
+
+/**
+ * The connect the standalone `?view=deep-connect` page runs on its own
+ * confirm (or once behind a `go=1` that the hand-off armed). Same plan, same
+ * backend route, but confirm-first lives in the VIEW (a styled card the user
+ * clicks), so this runner opens no dialog, asks nothing and writes nothing
+ * the view's confirm did not cover:
+ *  - a saved host connects straight through `app.tabs.connectHost`, whose
+ *    frame bridge resolves the record in the shell's host store and opens
+ *    the session host-side; an omitted type keeps the shell's default
+ *    resolution (the frame registry behind getDefaultConnectionTab may be
+ *    empty in a standalone view);
+ *  - an ad-hoc link with a verifiable credential is adopted on the spot —
+ *    POST /adopt creates the record, `notifyHostsChanged` makes the shell
+ *    reload its store, and the session opens on the NEW id. Without that
+ *    id there is no path: the frame bridge opens hosts by id only, and
+ *    SDK 2.11.0 has no bridge call for a synthetic quick-connect record.
+ * Every access is feature-detected — a missing surface is EXPECTED (that is
+ * the hand-off's new-tab fallback trigger), never an error.
+ */
+export async function runConnectIntentSilently(
+  app: TermixApp,
+  intent: DeepLinkConnectIntent,
+  options: DeepLinkConsumerSettings = {},
+): Promise<ViewConnectOutcome> {
+  const settings = resolveSettings(options);
+  const t = app?.t ?? ((key: string) => key);
+  if (
+    !app ||
+    typeof app.listHosts !== "function" ||
+    !app.tabs ||
+    typeof app.tabs.connectHost !== "function"
+  ) {
+    return "unavailable";
+  }
+  const { hosts, credentials, protocols } = await settlePlanContext(
+    app,
+    intent,
+    settings,
+  );
+  const plan = resolveConnectPlan({
+    intent,
+    hosts,
+    credentials,
+    protocols,
+    buildQuickConnect: createQuickConnectHost,
+  });
+  if (plan.status === "hostNotFound") {
+    toast.error(t("deepLink.hostNotFound", { host: intent.hostName }));
+    return "failed";
+  }
+  if (plan.status === "typeUnknown") {
+    toast.error(t("deepLink.typeUnknown", { type: intent.type ?? "" }));
+    return "failed";
+  }
+  if (plan.status === "credentialNotFound") {
+    toast.error(
+      t("deepLink.credentialNotFound", { name: intent.credentialName ?? "" }),
+    );
+    return "failed";
+  }
+  if (plan.status === "saved") {
+    try {
+      app.tabs.connectHost(
+        plan.host as Parameters<typeof app.tabs.connectHost>[0],
+        plan.typeToPass,
+      );
+      return "opened";
+    } catch {
+      // The bridge refused or the surface threw: the new-tab fallback is the
+      // rescue path, not a retry here.
+      return "unavailable";
+    }
+  }
+  // Ad-hoc: only the adopt route can hand back a host id the frame bridge
+  // can open. A link without a verifiable credential has no adopt request
+  // and cannot complete in a frame.
+  const adopt = plan.dialog?.adopt;
+  const api = (settings?.adoptApi?.() ?? app.api) as
+    PluginApiClient | undefined;
+  if (!adopt || !api || typeof api.post !== "function") {
+    return "unavailable";
+  }
+  try {
+    const { data } = await api.post<{
+      created: boolean;
+      hostId: number;
+      reason?: string;
+    }>("/adopt", {
+      hostName: adopt.hostName,
+      type: adopt.type,
+      credentialId: adopt.credentialId,
+      port: adopt.port,
+      ...(adopt.domain ? { domain: adopt.domain } : {}),
+    });
+    const createdHostId = data?.hostId ?? null;
+    if (createdHostId === null) return "unavailable";
+    // The shell's store must learn the new row before the tab below resolves
+    // its id; the bridge reload (this fires the shell's own refresh event)
+    // plus the live-list poll below cover the write-to-store lag.
+    notifyShellHostsChanged();
+    toast.success(t("deepLink.adoptCreated", { host: adopt.hostName }));
+    const created = await pollCreatedHost(app, createdHostId);
+    const hostToConnect: PluginHostRecord =
+      created ??
+      ({
+        id: String(createdHostId),
+        name: adopt.hostName,
+        ip: adopt.hostName,
+        port: adopt.port,
+        connectionType: adopt.type,
+      } as PluginHostRecord);
+    // Same split as the shell consumer's adopted tail: non-ssh opens the
+    // protocol tab directly (the connect gate reads the possibly-stale
+    // store), ssh rides the terminal hand-off.
+    if (adopt.type !== "ssh") {
+      app.tabs.openTab(hostToConnect, adopt.type);
+    } else {
+      app.tabs.connectHost(
+        hostToConnect as Parameters<typeof app.tabs.connectHost>[0],
+        "terminal",
+      );
+    }
+    return "opened";
+  } catch {
+    // Route unavailable or the open leg threw: the hand-off's new-tab
+    // fallback re-runs the same plan in a fresh app page, where the POST is
+    // idempotent.
+    return "unavailable";
+  }
+}
+
+/**
  * Registers the activate-time consumer for browser `?connect=` links. Call
- * once from `activate`. No-ops on a standalone `?view=` page (the hand-off
- * component owns that URL), without a connect parameter, or when an intent
- * was already consumed.
+ * once from `activate`. No-ops when the page has no search string at all —
+ * core 26.11.3 runs this frontend in a sandboxed frame whose URL carries no
+ * query and forwards none of the page's search to background frames, so an
+ * empty search means this context cannot receive a web link; the standalone
+ * `?view=deep-connect` page is the web consumer there. A NON-empty search (a
+ * context that really carries the link) still consumes as before, except on
+ * a standalone `?view=` URL (the hand-off component owns it) — or without a
+ * connect parameter, or when an intent was already consumed.
  */
 export function startDeepLinkConsumer(
   app: TermixApp,
@@ -606,6 +806,7 @@ export function startDeepLinkConsumer(
   const env = options.env ?? {};
   if (consumed) return;
   const search = (env.locationSearch ?? (() => window.location.search))();
+  if (!search) return;
   const params = new URLSearchParams(search);
   // The standalone hand-off page owns deep-link params on a ?view= URL.
   if (params.has("view")) return;
