@@ -35,6 +35,7 @@ vi.mock("@termix-ssh/plugin-sdk/frontend", () => ({
 import { toast } from "sonner";
 import * as ui from "@termix-ssh/plugin-sdk/ui";
 import {
+  listCredentials as sdkListCredentials,
   notifyHostsChanged as sdkNotify,
   type PluginApiClient,
   type PluginCredentialSummary,
@@ -918,7 +919,8 @@ describe("resolveStandaloneLanding", () => {
       hostName: "10.0.0.5",
       type: "vnc",
       credentialId: 7,
-      port: 5900,
+      // No port: the view has no protocol registry to default from, so the
+      // adopt route applies its own protocol default server-side.
     });
     // The shell store is woken up both ways (window events + the SDK
     // bridge) so the app the user lands in can list the record.
@@ -1013,24 +1015,69 @@ describe("resolveStandaloneLanding", () => {
     expect(double.connectHost).not.toHaveBeenCalled();
   });
 
-  it("refuses an ad-hoc link whose type cannot ride a saved record", async () => {
-    // A registered plugin protocol the adopt route does not create: the
-    // carry-by-id quick connect exists in the shell, but the standalone
-    // surface has no way to materialize it — so it refuses honestly.
+  it("refuses a type the adopt route cannot create as typeUnknown", async () => {
+    // THE VIEW'S CLASSIFICATION SET IS THE ADOPT ROUTE'S SET: on the ?view=
+    // page the protocol registry never populates (the shell never mounts
+    // there), and no other client-side type list exists — the route's
+    // accepted set (ssh/vnc/rdp, ADOPTABLE_TYPES in src/backend/adopt.ts,
+    // mirrored in connect-plan) is the whole classification. A registered-
+    // elsewhere or fake type never adopts and keeps the typeUnknown refusal.
     const double = makeApp();
-    listProtocols.mockReturnValue([
-      { id: "custom-proto", defaultPort: 1234 },
-    ] as never);
     const landing = await resolveStandaloneLanding(
       double.app,
       parseDeepLinkConnect(
         "?connect=10.0.0.5&type=custom-proto&credential=Deploy%20Key&using=adhoc",
       )!,
     );
-    expect(landing).toEqual({ kind: "cannotAdopt" });
+    expect(landing).toEqual({ kind: "unresolved", reason: "typeUnknown" });
     expect(post).not.toHaveBeenCalled();
     expect(double.openTab).not.toHaveBeenCalled();
     expect(double.connectHost).not.toHaveBeenCalled();
+  });
+
+  it("adopts a vnc link on the registry-less view with zero protocol-registry waits", async () => {
+    // THE FIX PASS REGRESSION: a real view page's registry NEVER fills (the
+    // shell never mounts there) and the old landing spent its settle budget
+    // polling it and then refused with typeUnknown — dead VNC console links.
+    // The landing must classify the adoption by the link's own type instead:
+    // no listHostProtocols call at all, and no settle wait (resolves in real
+    // time far under the old 1500ms poll budget).
+    listProtocols.mockReturnValue([] as never); // the live view's truth
+    const double = makeApp();
+    const started = Date.now();
+    const landing = await resolveStandaloneLanding(
+      double.app,
+      parseDeepLinkConnect(
+        "?connect=10.0.0.5&type=vnc&credential=Deploy%20Key&using=adhoc",
+      )!,
+      { adoptApi: () => ({ post }) as unknown as PluginApiClient },
+    );
+    expect(Date.now() - started).toBeLessThan(1000);
+    expect(listProtocols).not.toHaveBeenCalled();
+    expect(landing).toEqual({ kind: "adopted", hostLabel: "10.0.0.5" });
+    // The rest of the settle is intact: the credential list was still read
+    // (the SDK module the landing falls back to — the double has no
+    // app-level list) before the adoption rode.
+    expect(sdkListCredentials).toHaveBeenCalledTimes(1);
+  });
+
+  it("carries an explicit port and domain through the intent-classified adoption", async () => {
+    const double = makeApp();
+    const landing = await resolveStandaloneLanding(
+      double.app,
+      parseDeepLinkConnect(
+        "?connect=10.0.0.5&type=rdp&domain=WAG&port=3390&credential=Deploy%20Key&using=adhoc",
+      )!,
+      { adoptApi: () => ({ post }) as unknown as PluginApiClient },
+    );
+    expect(landing).toEqual({ kind: "adopted", hostLabel: "10.0.0.5" });
+    expect(post).toHaveBeenCalledWith("/adopt", {
+      hostName: "10.0.0.5",
+      type: "rdp",
+      credentialId: 7,
+      port: 3390,
+      domain: "WAG",
+    });
   });
 
   it("never leaves a module-scoped state behind between landings", async () => {

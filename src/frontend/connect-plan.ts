@@ -65,7 +65,13 @@ export interface AdoptRequest {
   hostName: string;
   type: string;
   credentialId: number;
-  port: number;
+  /**
+   * The link's port, when a protocol (or the link itself) supplied one.
+   * Omitted when no default was available — the view's own-type
+   * classification knows no registry default port: the adopt route applies
+   * its own protocol default server-side, so an omitted port is not a guess.
+   */
+  port?: number;
   domain?: string;
 }
 
@@ -160,6 +166,22 @@ export function resolveConnectPlan(options: {
   credentials?: readonly PluginCredentialSummary[];
   protocols: readonly DeepLinkProtocol[];
   buildQuickConnect: QuickConnectBuilder;
+  /**
+   * The standalone view's landing classification (the `?view=` page only).
+   * The protocol registry never populates there: the shell never mounts on
+   * that page, so its shell-fed registries stay empty and a registry gate
+   * refuses links the adopt route can serve. ADOPTION only writes a host
+   * record, so an ad-hoc intent with an explicit type classifies by the
+   * link's own `type=` — the backend route validates connectionType itself,
+   * and its accepted set (`ADOPTABLE_TYPES` in src/backend/adopt.ts: ssh,
+   * vnc, rdp, mirrored in the constant above) is the complete set of types
+   * this classifier knows. A type outside it never adopts and keeps the
+   * typeUnknown refusal, exactly like a type the grammar cannot parse — no
+   * further client-side type lists exist beyond these mirrors. The landing
+   * opens no sessions, so the quick-connect fallback record is not built for
+   * an intent classified here.
+   */
+  classifyAdoptByIntentType?: boolean;
 }): ConnectPlan {
   const { intent, hosts, protocols, buildQuickConnect } = options;
   const savedHost =
@@ -169,10 +191,20 @@ export function resolveConnectPlan(options: {
   }
 
   const coreSsh = !intent.type || intent.type === "ssh";
+  const linkType = intent.type ?? "";
   const protocol = coreSsh
     ? undefined
     : protocols.find((p) => p.id === intent.type);
-  if (!savedHost && !coreSsh && !protocol) {
+  // The view landing has no registry to consult, so the link's own type
+  // classifies the ADOPTION and the backend route validates it (accepted
+  // set ssh/vnc/rdp — `ADOPTABLE_TYPES` in src/backend/adopt.ts, mirrored
+  // above; anything outside that set keeps the typeUnknown refusal below).
+  const adoptByIntent =
+    !protocol &&
+    !coreSsh &&
+    options.classifyAdoptByIntentType === true &&
+    ADOPTABLE_TYPES.has(linkType);
+  if (!savedHost && !coreSsh && !protocol && !adoptByIntent) {
     return { status: "typeUnknown" };
   }
 
@@ -209,6 +241,41 @@ export function resolveConnectPlan(options: {
 
   const address = intent.hostName;
   const username = credential?.username ?? "";
+  if (adoptByIntent) {
+    // The view's landing consumes only the adoption from the plan: it opens
+    // no sessions and builds no quick-connect fallback, so this leg returns
+    // the adopt dialog (or, credential-less, nothing to attach — the
+    // landing maps the missing adopt request to its cannotAdopt refusal).
+    // The link's own type IS the adopt type (validated by the backend
+    // route); with no registry default to fall back on, an absent link port
+    // stays absent — the route applies its protocol's default (22/5900/3389,
+    // its own `DEFAULT_PORTS`) server-side.
+    return {
+      status: "adhoc",
+      dialog: {
+        saved: false,
+        hostLabel: username ? `${username}@${address}` : address,
+        address,
+        ...(credential
+          ? {
+              credential,
+              credentialRides: true,
+              adopt: {
+                hostName: address,
+                type: linkType,
+                credentialId: credential.id,
+                ...(intent.port ? { port: intent.port } : {}),
+                ...(intent.domain ? { domain: intent.domain } : {}),
+              },
+            }
+          : {}),
+        viewOnly: intent.viewOnly,
+        // viewOnlyApplied is deliberately unset: the view opens no session,
+        // so nothing here ever applied view-only — no true claim this path
+        // cannot stand behind.
+      },
+    };
+  }
   // The verified credential rides by id on plugin-protocol quick connects
   // (the protocol plugin resolves it server-side); SSH always keeps the v1.2
   // username-carry shape because ssh has no resolving protocol plugin.

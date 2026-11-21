@@ -654,12 +654,14 @@ async function connectResolvedPlan(
  *  - "adopted": the consented adoption POST verified (2xx with a host id —
  *    created now, or an existing record matched/updated). Same landing.
  *  - "cannotAdopt": ad-hoc, but nothing can be attached or saved (no usable
- *    `credential=`, or a type the adopt route does not create) and the frame
- *    bridge has no id-less open path — the view refuses in place.
+ *    `credential=`) and the frame bridge has no id-less open path — the view
+ *    refuses in place.
  *  - "adoptFailed": the POST failed or its response carried no host id —
  *    no navigation, no "saved" claim.
  *  - "unresolved": host, credential or type never resolved (or the live
- *    surfaces could not be read); the view explains and nothing happens.
+ *    surfaces could not be read — a type outside the adopt route's set, the
+ *    only set this registry-less page can adopt for, refuses here too); the
+ *    view explains and nothing happens.
  */
 export type StandaloneLanding =
   | { kind: "saved"; hostLabel: string }
@@ -717,6 +719,15 @@ async function listCredentialsForLanding(
  *    resolves against (a frame can fetch; it cannot open sessions);
  *  - the adoption POST is the ONLY write, and it is only trusted when its
  *    response hands back a host id;
+ *  - the protocol registry is NEVER consulted: on the `?view=` page the
+ *    shell never mounts, so the shell-fed protocol registry (like the host
+ *    store) never populates and settle-polling it could only burn its whole
+ *    budget and then wrongly refuse. Ad-hoc intents with an explicit type
+ *    classify for ADOPTION by the link's own type instead
+ *    (classifyAdoptByIntentType) and the backend route validates
+ *    connectionType itself (accepted set: ssh, vnc, rdp — `ADOPTABLE_TYPES`
+ *    in src/backend/adopt.ts, mirrored in connect-plan); a type outside
+ *    that set never adopts and still refuses as typeUnknown;
  *  - this path NEVER calls `tabs.connectHost`/`tabs.openTab`: on the
  *    standalone page those bridges dead-end host-side and their rejections
  *    are unobservable, so a "success" read off them would be a lie. The app-
@@ -755,25 +766,30 @@ export async function resolveStandaloneLanding(
   if (intent.credentialName) {
     credentials = await listCredentialsForLanding(app);
   }
-  // The protocol registry fills shortly after the frame boots; poll briefly
-  // so an unfilled registry cannot turn a real link into a wrong refusal.
-  // Only relevant when the link names a non-ssh type (the only consumer of
-  // the registry below).
-  let protocols: DeepLinkProtocol[] = [];
-  if (intent.type && intent.type !== "ssh") {
-    const deadline = Date.now() + STANDALONE_SETTLE_MS;
-    while (true) {
-      protocols = listHostProtocols() as unknown as DeepLinkProtocol[];
-      if (protocols.length > 0 || Date.now() >= deadline) break;
-      await sleep(150);
-    }
-  }
+  // The protocol registry is deliberately NOT polled on this path (unlike
+  // settlePlanContext): on the standalone `?view=` page the shell never
+  // mounts, so the shell-fed protocol registry (like the host store) never
+  // populates — a settle poll can only burn its whole budget and then
+  // wrongly refuse links the adopt route can serve. ADOPTION writes a host
+  // record only, and the backend route validates connectionType itself
+  // (accepted set: ssh, vnc, rdp — `ADOPTABLE_TYPES` in
+  // src/backend/adopt.ts, mirrored in connect-plan), so ad-hoc intents with
+  // an explicit type classify for ADOPTION by the link's own type.
+  // typeUnknown stays the refusal for types outside that set, exactly like
+  // a type the grammar cannot parse — there is no further client-side type
+  // list beyond those mirrors. The hosts/credentials settle above is
+  // untouched: saved-host matches and credential names still resolve
+  // against the live surfaces. The DESKTOP and shell consumers keep their
+  // registry settle (settlePlanContext) — those contexts really do have one.
   const plan = resolveConnectPlan({
     intent,
     hosts,
     credentials,
-    protocols,
+    // The view's registry is always empty (shell-fed, never mounts here);
+    // intent-classified adoptions skip it entirely.
+    protocols: [],
     buildQuickConnect: createQuickConnectHost,
+    classifyAdoptByIntentType: true,
   });
   if (plan.status === "hostNotFound") {
     return { kind: "unresolved", reason: "hostNotFound" };
@@ -795,8 +811,9 @@ export async function resolveStandaloneLanding(
     };
   }
   // Ad-hoc: the only write this surface can honestly complete is the adopt
-  // POST, and only when the plan built a verified adopt request. Everything
-  // else (a credential-less address, a type the route cannot create) refuses.
+  // POST, and only when the plan built a verified adopt request. A
+  // credential-less address (nothing to attach or save) refuses here; a type
+  // the route cannot create already refused above as typeUnknown.
   const adopt = plan.dialog?.adopt;
   if (!adopt) {
     return { kind: "cannotAdopt" };
@@ -817,7 +834,10 @@ export async function resolveStandaloneLanding(
       hostName: adopt.hostName,
       type: adopt.type,
       credentialId: adopt.credentialId,
-      port: adopt.port,
+      // An intent-classified adoption (the view has no registry) carries no
+      // default port: omitting it lets the route apply its own protocol
+      // default (22/5900/3389 — the route's `DEFAULT_PORTS`) server-side.
+      ...(adopt.port === undefined ? {} : { port: adopt.port }),
       ...(adopt.domain ? { domain: adopt.domain } : {}),
     });
     // The response IS the verification: a host id (created now, or an

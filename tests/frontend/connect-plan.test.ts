@@ -37,6 +37,8 @@ function plan(
     hosts: PluginHostRecord[];
     credentials: PluginCredentialSummary[];
     protocols: DeepLinkProtocol[];
+    /** The view landing's own-type adoption classification. */
+    classify: boolean;
   }>,
 ) {
   return resolveConnectPlan({
@@ -45,6 +47,7 @@ function plan(
     credentials: overrides?.credentials ?? credentials,
     protocols: overrides?.protocols ?? protocols,
     buildQuickConnect: echoBuilder as never,
+    classifyAdoptByIntentType: overrides?.classify === true || undefined,
   });
 }
 
@@ -276,6 +279,101 @@ describe("resolveConnectPlan", () => {
     const login = (plain.host as Record<string, unknown>).quickConnectLogin as
       Record<string, unknown> | undefined;
     expect(login?.viewOnly ?? undefined).toBeUndefined();
+  });
+});
+
+describe("resolveConnectPlan classifyAdoptByIntentType (the view landing)", () => {
+  // The standalone `?view=` page has NO protocol registry: the shell never
+  // mounts there, so its shell-fed registries stay empty. The landing
+  // classifies an ad-hoc ADOPTION by the link's own `type=` — adoption only
+  // writes a host record, and the backend route validates connectionType
+  // itself (ADOPTABLE_TYPES in src/backend/adopt.ts: ssh, vnc, rdp — the
+  // set mirrored in the plan's ADOPTABLE_TYPES).
+  const noRegistry: DeepLinkProtocol[] = [];
+
+  it("classifies an ad-hoc vnc adoption by the link's own type without a registry", () => {
+    const result = plan("?connect=10.0.0.9&type=vnc&credential=vnc", {
+      protocols: noRegistry,
+      classify: true,
+    });
+    expect(result.status).toBe("adhoc");
+    expect(result.dialog?.adopt).toEqual({
+      hostName: "10.0.0.9",
+      type: "vnc",
+      credentialId: 8,
+      // No registry default to fall back on: no port — the adopt route
+      // applies its own protocol default server-side.
+    });
+    expect(result.dialog?.credentialRides).toBe(true);
+    // The landing opens no sessions: no quick-connect fallback record and
+    // no tab type are built on this leg.
+    expect(result.host).toBeUndefined();
+    expect(result.typeToPass).toBeUndefined();
+  });
+
+  it("carries the link's explicit port and rdp domain into the classified adopt", () => {
+    const result = plan(
+      "?connect=10.0.0.5&type=rdp&domain=WAG&port=3390&credential=deploy%20key&using=adhoc",
+      { protocols: noRegistry, classify: true },
+    );
+    expect(result.dialog?.adopt).toEqual({
+      hostName: "10.0.0.5",
+      type: "rdp",
+      credentialId: 7,
+      port: 3390,
+      domain: "WAG",
+    });
+  });
+
+  it("keeps a credential-less ad-hoc vnc link adopt-less for the cannotAdopt refusal", () => {
+    const result = plan("?connect=10.0.0.5&type=vnc&using=adhoc", {
+      protocols: noRegistry,
+      classify: true,
+    });
+    expect(result.status).toBe("adhoc");
+    expect(result.dialog?.adopt).toBeUndefined();
+    expect(result.host).toBeUndefined();
+  });
+
+  it("keeps typeUnknown for a type the adopt route cannot create", () => {
+    // A registered-elsewhere or fake type: the view cannot adopt it (the
+    // route refuses) and cannot open it, so the refusal stays exactly like
+    // the unclassified case — the route's accepted set is the whole
+    // classification, no new client-side deny-list beyond it.
+    expect(
+      plan("?connect=10.0.0.5&type=telnet&credential=vnc", {
+        protocols: noRegistry,
+        classify: true,
+      }).status,
+    ).toBe("typeUnknown");
+    expect(
+      plan("?connect=10.0.0.5&type=custom-proto&credential=vnc", {
+        protocols: noRegistry,
+        classify: true,
+      }).status,
+    ).toBe("typeUnknown");
+  });
+
+  it("a settled registry still wins when its protocol IS found (classification never fires)", () => {
+    // With a real protocol the plan behaves byte-identically to the
+    // registry-driven path the shell and desktop consumers always take.
+    const classified = plan("?connect=10.0.0.9&type=vnc&credential=vnc", {
+      classify: true,
+    });
+    const plain = plan("?connect=10.0.0.9&type=vnc&credential=vnc");
+    expect(classified.dialog?.adopt).toEqual(plain.dialog?.adopt);
+    expect(classified.host).toEqual(plain.host);
+    expect(classified.typeToPass).toBe(plain.typeToPass);
+  });
+
+  it("saved-host resolution is untouched by the classification", () => {
+    const result = plan("?connect=web%20server%201&type=vnc", {
+      protocols: noRegistry,
+      classify: true,
+    });
+    expect(result.status).toBe("saved");
+    expect(result.host).toEqual(hosts[0]);
+    expect(result.dialog?.adopt).toBeUndefined();
   });
 });
 

@@ -146,12 +146,10 @@ describe("StandaloneHandoff", () => {
     // Spied: every window.open below in these tests is the frame's bridged
     // escape hatch stand-in (root-relative → the app page origin).
     vi.spyOn(window, "open").mockImplementation(() => null);
-    // A settled protocol registry for the link classification; the refusal
-    // test below overrides it.
-    listProtocols.mockReturnValue([
-      { id: "rdp", defaultPort: 3389 },
-      { id: "vnc", defaultPort: 5900 },
-    ] as never);
+    // The ?view= page's registry NEVER populates (the shell never mounts
+    // there): the landing resolves without consulting it at all, so the
+    // empty value below is the live truth, not a "not settled yet" stand-in.
+    listProtocols.mockReturnValue([] as never);
   });
 
   afterEach(async () => {
@@ -201,14 +199,17 @@ describe("StandaloneHandoff", () => {
     expect(tabSpies(app).openTab).not.toHaveBeenCalled();
   });
 
-  it("refuses an unsupported ad-hoc type on the confirm click", async () => {
-    listProtocols.mockReturnValue([] as never);
+  it("refuses a connection type the adopt route cannot create", async () => {
+    // From the view, the classification set is the adopt route's accepted
+    // set (ssh/vnc/rdp — validated by the backend itself): a type outside it
+    // (the registry is absent on this page and never consulted) keeps the
+    // plain typeUnknown refusal. No poll runs first: this card is instant.
     const app = makeViewApp();
     setStandaloneApp(app);
-    await renderHandoff("connect=10.0.0.5&type=rdp&using=adhoc");
+    await renderHandoff("connect=10.0.0.5&type=telnet&using=adhoc");
     fireEvent.click(screen.getByText(locales.handoff.go));
-    // The unfilled registry settles within the landing's budget, then the
-    // plain refusal card shows — post, tabs and windows untouched.
+    // The link's own type is not one the save route can create: the plain
+    // refusal card shows — post, tabs and windows untouched.
     await waitFor(
       () => expect(screen.getByText(locales.handoff.noPlugin)).toBeTruthy(),
       { timeout: 5000 },
@@ -298,7 +299,8 @@ describe("StandaloneHandoff", () => {
       hostName: "10.0.0.5",
       type: "vnc",
       credentialId: 5,
-      port: 5900,
+      // No port: the view has no protocol registry to default from, so the
+      // adopt route applies its own protocol default server-side.
     });
     // The tab opens only AFTER the verified response: adoption first,
     // landing second, in that order.
@@ -313,6 +315,43 @@ describe("StandaloneHandoff", () => {
         locales.handoff.finishAdopted.replace("{{host}}", "10.0.0.5"),
       ),
     ).toBeTruthy();
+    expect(tabSpies(app).connectHost).not.toHaveBeenCalled();
+    expect(tabSpies(app).openTab).not.toHaveBeenCalled();
+  });
+
+  it("adopts a VNC console link on the registry-less view instantly (the fix-pass regression)", async () => {
+    // THE LIVE SOAK FINDING, as a test: on a real ?view= page the protocol
+    // registry NEVER populates (the shell never mounts there). The old
+    // landing polled it for its whole settle budget and then refused with
+    // the typeUnknown card — every VNC console link was dead from the web.
+    // Now the adoption classifies by the link's own type with no registry
+    // read at all: same confirm → verified POST → the landing card, fast.
+    const app = makeViewApp({
+      credentials: [deployKey],
+      adopt: { result: { data: { created: true, hostId: 42 } } },
+    });
+    setStandaloneApp(app);
+    await renderHandoff("connect=10.0.0.5&type=vnc&credential=Deploy%20Key");
+    expect(listProtocols).not.toHaveBeenCalled(); // rendering: no poll leg
+    const started = Date.now();
+    fireEvent.click(screen.getByText(locales.handoff.go));
+    await waitFor(() =>
+      expect(screen.getByText(locales.handoff.finishTitle)).toBeTruthy(),
+    );
+    // The whole confirm→save→landing flow stays far under the old 1500ms
+    // registry settle budget — no dead wait survives in the path.
+    expect(Date.now() - started).toBeLessThan(1000);
+    expect(listProtocols).not.toHaveBeenCalled();
+    const post = (app.api as unknown as { post: ReturnType<typeof vi.fn> })
+      .post;
+    expect(post).toHaveBeenCalledTimes(1);
+    expect(
+      screen.getByText(
+        locales.handoff.finishAdopted.replace("{{host}}", "10.0.0.5"),
+      ),
+    ).toBeTruthy();
+    expect(window.open).toHaveBeenCalledTimes(1);
+    expect(window.open).toHaveBeenCalledWith("/", "_blank");
     expect(tabSpies(app).connectHost).not.toHaveBeenCalled();
     expect(tabSpies(app).openTab).not.toHaveBeenCalled();
   });
