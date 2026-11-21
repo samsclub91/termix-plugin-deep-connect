@@ -64,20 +64,29 @@ export function registerAdoptRoutes(ctx: PluginContext): void {
   const router = ctx.http.router<AdoptRoute>();
   router.post("/adopt", async (req, res) => {
     const body = (req.body ?? {}) as AdoptBody;
-    const hostName = typeof body.hostName === "string" ? body.hostName.trim() : "";
+    const hostName =
+      typeof body.hostName === "string" ? body.hostName.trim() : "";
     const type = typeof body.type === "string" ? body.type.toLowerCase() : "";
     const credentialId = Number(body.credentialId);
 
-    if (!hostName || !ADOPTABLE_TYPES.has(type) || !Number.isInteger(credentialId) || credentialId <= 0) {
+    if (
+      !hostName ||
+      !ADOPTABLE_TYPES.has(type) ||
+      !Number.isInteger(credentialId) ||
+      credentialId <= 0
+    ) {
       res.status(400).json({
-        error: "hostName, a supported connection type and a numeric credentialId are required",
+        error:
+          "hostName, a supported connection type and a numeric credentialId are required",
       });
       return;
     }
 
     const portNumber = Number(body.port);
     const port =
-      Number.isInteger(portNumber) && portNumber > 0 ? portNumber : DEFAULT_PORTS[type];
+      Number.isInteger(portNumber) && portNumber > 0
+        ? portNumber
+        : DEFAULT_PORTS[type];
 
     // Idempotent: a matching host name or address means the saved-host flow
     // takes over with no duplicate record. For VNC/RDP intents the record is
@@ -87,7 +96,9 @@ export function registerAdoptRoutes(ctx: PluginContext): void {
     // is a self-healing update of records the plugin (or an earlier release
     // of it) created mis-shaped; ids ride only, never secrets.
     const existing = await ctx.hosts.list();
-    const dup = existing.find((row) => row.name === hostName || row.ip === hostName);
+    const dup = existing.find(
+      (row) => row.name === hostName || row.ip === hostName,
+    );
     if (dup) {
       if (type === "ssh" || !dup.id) {
         res.json({ created: false, hostId: dup.id, reason: "exists" });
@@ -126,7 +137,12 @@ export function registerAdoptRoutes(ctx: PluginContext): void {
         // A shared host the user cannot edit: the link still connects with
         // whatever the record has, or the ad-hoc fallback covers it.
         const message = error instanceof Error ? error.message : String(error);
-        res.json({ created: false, hostId: dup.id, reason: "exists", note: message });
+        res.json({
+          created: false,
+          hostId: dup.id,
+          reason: "exists",
+          note: message,
+        });
       }
       return;
     }
