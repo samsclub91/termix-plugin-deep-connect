@@ -130,8 +130,11 @@ For example: `termix://connect/Web%20Server%201?type=vnc&viewonly=1` or
   dialog always names the credential, so never accept a link that names a log-in you do not
   expect.
 - A link with no saved match and no type is refused; an ad-hoc link whose type no registered
-  plugin provides is refused with a toast in the app (and the `?view=` page refuses it after
-  the confirm click, once the protocol registry has settled).
+  plugin provides is refused with a toast in the app. The `?view=` page never consults a
+  plugin registry (the shell does not mount there): ad-hoc links with `type=vnc` or `type=rdp`
+  finish exactly like SSH ones — with a usable `credential=` the record is saved to Termix on
+  your confirm — while a link type the save route cannot create is refused there after the
+  confirm click.
 - In the web `?view=` flow an ad-hoc link **without a matched `credential=`** cannot open or
   save: Termix's plugin frames open sessions by saved host id only, and there is nothing to
   attach. The view refuses it in place — no save, no tab — and points at the manual
