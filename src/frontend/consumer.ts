@@ -89,6 +89,17 @@ function resolveSettings(options: DeepLinkConsumerSettings): ResolvedSettings {
 /** Module-scoped guard: one search-param intent per page load, even across re-activates. */
 let consumed = false;
 
+/**
+ * Desktop links this session has already enqueued (port of core's own guard
+ * in use-host-links.ts: "Each link opens a host once, even when a remount
+ * replays it"). Core's deep-links onOpen replays its ≤20 recent links to
+ * EVERY new registration too, so a plugin disable/enable re-delivers them to
+ * the re-registered consumer and each old link would re-confirm serially.
+ * The check runs on link OBJECT identity — a fresh delivery of the same URL
+ * is a new object and still runs.
+ */
+let handledTermixLinks = new WeakSet<object>();
+
 function shellReady(app: TermixApp): Promise<void> {
   return new Promise((resolve) => {
     if (app.tabs.getLayout() !== null) {
@@ -623,8 +634,12 @@ export function startDeepLinkConsumer(
  * seam (a web browser never has termix:// links — `app.deepLinks` is
  * undefined there). Core replays links that arrived before registration, so
  * a link the desktop app was opened with still lands; links run one at a
- * time in arrival order, and EVERY parsed link still confirms first. Core's
- * own termix://host/<id> form is core's — parseTermixLinkUrl ignores it.
+ * time in arrival order, and EVERY parsed link still confirms first. Core
+ * replays to every NEW registration as well (a plugin disable/enable
+ * re-delivers its recent links), so a link object already enqueued this
+ * session is dropped before the replay promise chain instead of
+ * re-confirming. Core's own termix://host/<id> form is core's —
+ * parseTermixLinkUrl ignores it.
  */
 export function startTermixLinkConsumer(
   app: TermixApp,
@@ -637,6 +652,11 @@ export function startTermixLinkConsumer(
   const disposer = deepLinks.onOpen((link) => {
     const intent = parseTermixLinkUrl(link?.url ?? "");
     if (!intent) return; // termix://host/<id> and anything unparsable
+    // Replay dedup BEFORE the promise chain, in arrival order: a link object
+    // core already handed to a listener this session runs at most once, so a
+    // disable/enable replay does not re-confirm consumed links.
+    if (handledTermixLinks.has(link)) return;
+    handledTermixLinks.add(link);
     chain = chain.then(async () => {
       try {
         await runConnectIntent(app, intent, settings);
@@ -648,7 +668,8 @@ export function startTermixLinkConsumer(
   app.onDispose?.(disposer);
 }
 
-/** Test seam: forget the module-scoped consumption guard. */
+/** Test seam: forget the module-scoped consumption guards and replay dedup. */
 export function resetDeepLinkConsumerForTests(): void {
   consumed = false;
+  handledTermixLinks = new WeakSet<object>();
 }

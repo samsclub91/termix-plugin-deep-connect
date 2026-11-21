@@ -73,6 +73,8 @@ interface AppDouble {
   openTab: ReturnType<typeof vi.fn>;
   onOpen: ReturnType<typeof vi.fn>;
   fireReady: () => void;
+  disposeAll: () => void;
+  deliverLink: (link: TestLink) => void;
   t: (key: string, opts?: Record<string, unknown>) => string;
 }
 
@@ -84,16 +86,34 @@ function makeApp(options?: {
   queuedLinks?: TestLink[];
 }): AppDouble {
   const onReadyListeners: (() => void)[] = [];
+  const disposers: (() => void)[] = [];
   const t = (key: string, opts?: Record<string, unknown>) =>
     opts ? `${key}:${JSON.stringify(opts)}` : key;
   const confirm = vi.fn(async () => options?.confirmResult ?? true);
   const listHosts = vi.fn(async () => options?.hosts ?? hosts);
+  // A faithful stand-in for core's deep-links module: deliveries land in a
+  // recent list (≤20) that every NEW registration replays — the same link
+  // objects, exactly what a plugin disable/enable hands back — and the
+  // returned disposer removes only that listener from later deliveries.
+  const activeListeners = new Set<(link: TestLink) => void>();
+  const recentLinks: TestLink[] = [];
   const onOpen = vi.fn((listener: (link: TestLink) => void): (() => void) => {
-    for (const link of options?.queuedLinks ?? []) {
+    activeListeners.add(listener);
+    for (const link of recentLinks) {
       listener(link);
     }
-    return () => {};
+    return () => activeListeners.delete(listener);
   });
+  const deliverLink = (link: TestLink): void => {
+    recentLinks.push(link);
+    if (recentLinks.length > 20) recentLinks.shift();
+    for (const listener of [...activeListeners]) {
+      listener(link);
+    }
+  };
+  for (const link of options?.queuedLinks ?? []) {
+    deliverLink(link);
+  }
   const app = {
     pluginId: "deep-connect",
     t,
@@ -111,6 +131,9 @@ function makeApp(options?: {
       connectHost: vi.fn(),
       openTab: vi.fn(),
     },
+    onDispose: (fn: () => void) => {
+      disposers.push(fn);
+    },
     ...(options?.queuedLinks ? { deepLinks: { onOpen } } : {}),
   } as unknown as TermixApp;
   return {
@@ -122,6 +145,8 @@ function makeApp(options?: {
       .openTab,
     onOpen,
     fireReady: () => onReadyListeners.forEach((listener) => listener()),
+    disposeAll: () => disposers.forEach((disposer) => disposer()),
+    deliverLink,
     t,
   };
 }
@@ -863,6 +888,39 @@ describe("startTermixLinkConsumer", () => {
     expect(double.confirm.mock.invocationCallOrder[0]).toBeLessThan(
       double.confirm.mock.invocationCallOrder[1],
     );
+  });
+
+  it("ignores a replayed link after re-registration, and runs a new link", async () => {
+    const double = makeApp({
+      queuedLinks: [
+        { url: "termix://connect/Web%20Server%201", source: "os-scheme" },
+      ],
+    });
+    defaultTab.mockReturnValue("terminal" as never);
+    vi.useFakeTimers();
+    // First registration: core replays the launch link; it confirms once.
+    startTermixLinkConsumer(double.app, linkSettings());
+    await vi.advanceTimersByTimeAsync(300);
+    expect(double.confirm).toHaveBeenCalledTimes(1);
+    expect(double.connectHost).toHaveBeenCalledTimes(1);
+    // Plugin disable/enable: the disposer fires, activate registers again,
+    // and core replays the SAME link object to the new listener. The replay
+    // must NOT enqueue or re-confirm the already-consumed link.
+    double.disposeAll();
+    startTermixLinkConsumer(double.app, linkSettings());
+    await vi.advanceTimersByTimeAsync(300);
+    expect(double.confirm).toHaveBeenCalledTimes(1);
+    expect(double.connectHost).toHaveBeenCalledTimes(1);
+    // A genuinely new delivery (a fresh link object — the guard is identity,
+    // not the URL) still runs, after the replayed delivery was dropped.
+    double.deliverLink({
+      url: "termix://connect/10.0.0.5?type=vnc",
+      source: "os-scheme",
+    });
+    await vi.advanceTimersByTimeAsync(300);
+    expect(double.confirm).toHaveBeenCalledTimes(2);
+    expect(double.connectHost).toHaveBeenCalledTimes(2);
+    expect(double.connectHost.mock.calls[1][1]).toBe("vnc");
   });
 
   it("carries the credential id and view-only flag through a termix link", async () => {

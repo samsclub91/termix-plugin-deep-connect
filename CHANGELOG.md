@@ -12,6 +12,7 @@
 
 - `viewonly=1` now applies: ad-hoc RDP/VNC quick connects open with the session's input off (`quickConnectLogin.viewOnly`). It stays restrict-only — the parameter is accepted exactly as `1` and can only turn input off, never on; every other value is ignored. Saved hosts and SSH links still read the note without acting on it
 - Desktop app `termix://` links (`app.deepLinks`, Termix 26.11.3) connect through the same grammar: `termix://connect/<target>?type=…` and `termix://…?connect=…&type=…&…` forms reach the same plan, the same confirm and the same connect path as browser `?connect=` links. Core's own `termix://host/<id>` form is left to Termix, and every `termix://` connect still confirms first — the OS scheme is reachable from anywhere, so nothing opens without your click
+- Repeated replays of the same desktop link are ignored per session: the desktop layer replays recently seen `termix://` links to every new listener registration (a plugin disable/enable cycle re-delivers them), so a link that already ran its confirm this session is dropped instead of re-confirmed — a port of core's own replay guard
 
 ## 1.2.0
 
