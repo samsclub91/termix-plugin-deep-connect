@@ -52,7 +52,7 @@ Every parameter is optional except `connect`:
 | `port`       | Port override (ad-hoc connects only)                            |
 | `domain`     | AD domain for ad-hoc RDP direct auth                            |
 | `using`      | `adhoc` forces an ad-hoc connect; `name` forces the host lookup |
-| `viewonly`   | Reserved (parsed, shown in the confirm text, not applied yet)   |
+| `viewonly`   | Ad-hoc RDP/VNC: session opens with input off (exact `1` only)   |
 
 `credential` and `port` must be percent-encoded when they contain spaces or special
 characters.
@@ -63,11 +63,15 @@ characters.
   cancelling clears the link from the URL.
 - **Saved hosts** connect with their own stored log-ins — a `credential=` name is verified
   and shown in the confirm text, but does not replace the host's login.
-- **Ad-hoc links** cannot carry a stored password or key: the session stops at Termix's
-  own prompt (SSH) or remote-desktop's prompt (RDP/VNC), and the confirm dialog states it.
+- **Ad-hoc links** carry names, never secrets. An RDP/VNC link with a matching `credential=` name
+  connects by credential id (resolved server-side by the protocol plugin — the secret never
+  reaches the browser); without any `credential=` it stops at remote-desktop's own prompt; an
+  unmatched credential name is refused rather than prompting or downgrading. An SSH link adopts a
+  saved host or stops at Termix's own SSH prompt. The confirm dialog always states what will be
+  used.
 - Signed-out browsers get the Termix login first and return to the link; unknown
   parameters and `view=` are dropped on the way by the hand-off page.
-- Termix needs engine 26.11.1 or newer and the plugin enabled for your role
+- Termix needs engine 26.11.3 or newer and the plugin enabled for your role
   (admins and users by default).
 - Verify the template-token syntax against your own Lansweeper version before rollout —
   it varies between releases.
