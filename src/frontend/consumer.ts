@@ -31,7 +31,8 @@ import {
  * Consumes a raw `?connect=` deep link at activate time, exactly once, inside
  * the real app shell. A browser `?view=` page never mounts the shell (its
  * shell callbacks are unbound there), so consumers only run on the normal
- * app — that is why the standalone hand-off page relaunches the app first.
+ * app — the standalone `?view=` page resolves its link itself, with the
+ * honest landing below (`resolveStandaloneLanding`).
  *
  * Gating (ported from core's use-deep-link-connect):
  *  - `app.tabs.onReady` fires once the shell has restored its tabs after
@@ -121,9 +122,8 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 /**
  * Waits (up to ~3s) for a freshly written host row to show up in the live
  * host list, which can lag the write by a settle. Shared by the adopt-then-
- * connect tail of the shell consumer and the standalone view's silent
- * runner. Caller connects against the adopt request's own shape when this
- * comes back undefined.
+ * connect tail of the shell consumer. Caller connects against the adopt
+ * request's own shape when this comes back undefined.
  */
 async function pollCreatedHost(
   app: TermixApp,
@@ -180,8 +180,7 @@ interface PlanContext {
  * Settles the context an intent resolves against: shell readiness plus the
  * host list and the host-protocol registry. Both registries fill shortly
  * after the plugin runtime starts, within the settle budget below.
- * Shared by the browser search consumer, the desktop termix:// consumer and
- * the standalone view's silent connect runner.
+ * Shared by the browser search consumer and the desktop termix:// consumer.
  */
 async function settlePlanContext(
   app: TermixApp,
@@ -275,7 +274,7 @@ export async function runConnectIntent(
  * actually reaches the store. Both paths run; each is a no-op where it
  * does not apply.
  */
-function notifyShellHostsChanged(): void {
+export function notifyShellHostsChanged(): void {
   if (typeof window !== "undefined") {
     for (const name of ["termix:hosts-changed", "ssh-hosts:changed"]) {
       try {
@@ -646,56 +645,129 @@ async function connectResolvedPlan(
 }
 
 /**
- * What the standalone view's in-frame connect attempt concluded:
- *  - "opened": a session was dispatched (the saved-host connect or the
- *    adopt-then-connect path completed without a local error),
- *  - "failed": the link cannot open anything (unresolved host/type/
- *    credential) — the toast is shown, and a new tab would only repeat it,
- *  - "unavailable": the app surface cannot act from here (missing bridge,
- *    thrown call, or an ad-hoc link that has no path to a real host id) —
- *    the hand-off falls back to its new-tab entry.
+ * What the standalone `?view=` page can honestly do with a confirmed link:
+ *  - "saved": the link matched a real saved host (read from the live host
+ *    list, which works inside a frame). Nothing opens from a frame — shell
+ *    callbacks are unbound and the host store is empty on that page, so
+ *    every tabs.* call dead-ends unobservably — the landing is Termix
+ *    itself, where the user starts the session from the Hosts list.
+ *  - "adopted": the consented adoption POST verified (2xx with a host id —
+ *    created now, or an existing record matched/updated). Same landing.
+ *  - "cannotAdopt": ad-hoc, but nothing can be attached or saved (no usable
+ *    `credential=`, or a type the adopt route does not create) and the frame
+ *    bridge has no id-less open path — the view refuses in place.
+ *  - "adoptFailed": the POST failed or its response carried no host id —
+ *    no navigation, no "saved" claim.
+ *  - "unresolved": host, credential or type never resolved (or the live
+ *    surfaces could not be read); the view explains and nothing happens.
  */
-export type ViewConnectOutcome = "opened" | "failed" | "unavailable";
+export type StandaloneLanding =
+  | { kind: "saved"; hostLabel: string }
+  | { kind: "adopted"; hostLabel: string }
+  | { kind: "cannotAdopt" }
+  | { kind: "adoptFailed" }
+  | {
+      kind: "unresolved";
+      reason:
+        | "hostNotFound"
+        | "credentialNotFound"
+        | "typeUnknown"
+        | "listUnavailable";
+    };
+
+/** How long the landing may wait for the live host list / protocol registry. */
+const STANDALONE_SETTLE_MS = 1500;
 
 /**
- * The connect the standalone `?view=deep-connect` page runs on its own
- * confirm (or once behind a `go=1` that the hand-off armed). Same plan, same
- * backend route, but confirm-first lives in the VIEW (a styled card the user
- * clicks), so this runner opens no dialog, asks nothing and writes nothing
- * the view's confirm did not cover:
- *  - a saved host connects straight through `app.tabs.connectHost`, whose
- *    frame bridge resolves the record in the shell's host store and opens
- *    the session host-side; an omitted type keeps the shell's default
- *    resolution (the frame registry behind getDefaultConnectionTab may be
- *    empty in a standalone view);
- *  - an ad-hoc link with a verifiable credential is adopted on the spot —
- *    POST /adopt creates the record, `notifyHostsChanged` makes the shell
- *    reload its store, and the session opens on the NEW id. Without that
- *    id there is no path: the frame bridge opens hosts by id only, and
- *    SDK 2.11.0 has no bridge call for a synthetic quick-connect record.
- * Every access is feature-detected — a missing surface is EXPECTED (that is
- * the hand-off's new-tab fallback trigger), never an error.
+ * The credential list for the landing. The SDK module is the real surface
+ * (SDK 2.11.0); an app-level list is honored first when the runtime bridges
+ * one, which is also the seam test doubles use. Both are redacted summaries
+ * — a name, an optional username, never a secret.
  */
-export async function runConnectIntentSilently(
+async function listCredentialsForLanding(
+  app: TermixApp,
+): Promise<PluginCredentialSummary[]> {
+  const member = (
+    app as {
+      listCredentials?: () => Promise<unknown>;
+    }
+  ).listCredentials;
+  if (typeof member === "function") {
+    try {
+      const rows = await member.call(app);
+      if (Array.isArray(rows)) return rows as PluginCredentialSummary[];
+    } catch {
+      return [];
+    }
+  }
+  try {
+    const rows = await listCredentials();
+    return Array.isArray(rows) ? rows : [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * The standalone `?view=` page's landing resolver — runs on the user's
+ * confirm click, AFTER the styled card was accepted (the one consent of the
+ * whole flow). Same plan as the shell consumer (resolveConnectPlan), but the
+ * frame reality shapes the tail:
+ *  - the live `listHosts` / `listCredentials` fetches verify what the link
+ *    resolves against (a frame can fetch; it cannot open sessions);
+ *  - the adoption POST is the ONLY write, and it is only trusted when its
+ *    response hands back a host id;
+ *  - this path NEVER calls `tabs.connectHost`/`tabs.openTab`: on the
+ *    standalone page those bridges dead-end host-side and their rejections
+ *    are unobservable, so a "success" read off them would be a lie. The app-
+ *    root tab and the finish card are the view's job, not this resolver's.
+ */
+export async function resolveStandaloneLanding(
   app: TermixApp,
   intent: DeepLinkConnectIntent,
-  options: DeepLinkConsumerSettings = {},
-): Promise<ViewConnectOutcome> {
-  const settings = resolveSettings(options);
-  const t = app?.t ?? ((key: string) => key);
-  if (
-    !app ||
-    typeof app.listHosts !== "function" ||
-    !app.tabs ||
-    typeof app.tabs.connectHost !== "function"
-  ) {
-    return "unavailable";
+  options: Pick<DeepLinkConsumerSettings, "adoptApi"> = {},
+): Promise<StandaloneLanding> {
+  if (!app || typeof app.listHosts !== "function") {
+    return { kind: "unresolved", reason: "listUnavailable" };
   }
-  const { hosts, credentials, protocols } = await settlePlanContext(
-    app,
-    intent,
-    settings,
-  );
+  // An explicit ad-hoc link never reads hosts; every other link needs the
+  // live list and refuses to claim anything while it stays unreadable.
+  let hosts: PluginHostRecord[] = [];
+  if (intent.using !== "adhoc") {
+    let answered = false;
+    const deadline = Date.now() + STANDALONE_SETTLE_MS;
+    while (true) {
+      try {
+        const rows = await app.listHosts();
+        if (Array.isArray(rows)) {
+          hosts = rows;
+          answered = true;
+        }
+      } catch {
+        // The list can lag one settle behind; retry until the budget is spent.
+      }
+      if (answered || Date.now() >= deadline) break;
+      await sleep(150);
+    }
+    if (!answered) return { kind: "unresolved", reason: "listUnavailable" };
+  }
+  let credentials: PluginCredentialSummary[] = [];
+  if (intent.credentialName) {
+    credentials = await listCredentialsForLanding(app);
+  }
+  // The protocol registry fills shortly after the frame boots; poll briefly
+  // so an unfilled registry cannot turn a real link into a wrong refusal.
+  // Only relevant when the link names a non-ssh type (the only consumer of
+  // the registry below).
+  let protocols: DeepLinkProtocol[] = [];
+  if (intent.type && intent.type !== "ssh") {
+    const deadline = Date.now() + STANDALONE_SETTLE_MS;
+    while (true) {
+      protocols = listHostProtocols() as unknown as DeepLinkProtocol[];
+      if (protocols.length > 0 || Date.now() >= deadline) break;
+      await sleep(150);
+    }
+  }
   const plan = resolveConnectPlan({
     intent,
     hosts,
@@ -704,46 +776,43 @@ export async function runConnectIntentSilently(
     buildQuickConnect: createQuickConnectHost,
   });
   if (plan.status === "hostNotFound") {
-    toast.error(t("deepLink.hostNotFound", { host: intent.hostName }));
-    return "failed";
+    return { kind: "unresolved", reason: "hostNotFound" };
   }
   if (plan.status === "typeUnknown") {
-    toast.error(t("deepLink.typeUnknown", { type: intent.type ?? "" }));
-    return "failed";
+    return { kind: "unresolved", reason: "typeUnknown" };
   }
   if (plan.status === "credentialNotFound") {
-    toast.error(
-      t("deepLink.credentialNotFound", { name: intent.credentialName ?? "" }),
-    );
-    return "failed";
+    return { kind: "unresolved", reason: "credentialNotFound" };
   }
   if (plan.status === "saved") {
-    try {
-      app.tabs.connectHost(
-        plan.host as Parameters<typeof app.tabs.connectHost>[0],
-        plan.typeToPass,
-      );
-      return "opened";
-    } catch {
-      // The bridge refused or the surface threw: the new-tab fallback is the
-      // rescue path, not a retry here.
-      return "unavailable";
-    }
+    const recordName = (plan.host as PluginHostRecord | undefined)?.name;
+    return {
+      kind: "saved",
+      hostLabel:
+        typeof recordName === "string" && recordName
+          ? recordName
+          : intent.hostName,
+    };
   }
-  // Ad-hoc: only the adopt route can hand back a host id the frame bridge
-  // can open. A link without a verifiable credential has no adopt request
-  // and cannot complete in a frame.
+  // Ad-hoc: the only write this surface can honestly complete is the adopt
+  // POST, and only when the plan built a verified adopt request. Everything
+  // else (a credential-less address, a type the route cannot create) refuses.
   const adopt = plan.dialog?.adopt;
-  const api = (settings?.adoptApi?.() ?? app.api) as
-    PluginApiClient | undefined;
-  if (!adopt || !api || typeof api.post !== "function") {
-    return "unavailable";
+  if (!adopt) {
+    return { kind: "cannotAdopt" };
   }
+  const api = (options.adoptApi?.() ?? app.api) as PluginApiClient | undefined;
+  if (!api || typeof api.post !== "function") {
+    return { kind: "adoptFailed" };
+  }
+  let savedName = adopt.hostName;
   try {
     const { data } = await api.post<{
       created: boolean;
-      hostId: number;
+      hostId: number | string;
       reason?: string;
+      hostName?: string;
+      error?: string;
     }>("/adopt", {
       hostName: adopt.hostName,
       type: adopt.type,
@@ -751,41 +820,24 @@ export async function runConnectIntentSilently(
       port: adopt.port,
       ...(adopt.domain ? { domain: adopt.domain } : {}),
     });
-    const createdHostId = data?.hostId ?? null;
-    if (createdHostId === null) return "unavailable";
-    // The shell's store must learn the new row before the tab below resolves
-    // its id; the bridge reload (this fires the shell's own refresh event)
-    // plus the live-list poll below cover the write-to-store lag.
-    notifyShellHostsChanged();
-    toast.success(t("deepLink.adoptCreated", { host: adopt.hostName }));
-    const created = await pollCreatedHost(app, createdHostId);
-    const hostToConnect: PluginHostRecord =
-      created ??
-      ({
-        id: String(createdHostId),
-        name: adopt.hostName,
-        ip: adopt.hostName,
-        port: adopt.port,
-        connectionType: adopt.type,
-      } as PluginHostRecord);
-    // Same split as the shell consumer's adopted tail: non-ssh opens the
-    // protocol tab directly (the connect gate reads the possibly-stale
-    // store), ssh rides the terminal hand-off.
-    if (adopt.type !== "ssh") {
-      app.tabs.openTab(hostToConnect, adopt.type);
-    } else {
-      app.tabs.connectHost(
-        hostToConnect as Parameters<typeof app.tabs.connectHost>[0],
-        "terminal",
-      );
+    // The response IS the verification: a host id (created now, or an
+    // existing record matched/updated) is the only trusted "saved" fact.
+    const hostId = data?.hostId;
+    if (hostId === null || hostId === undefined || String(hostId) === "") {
+      return { kind: "adoptFailed" };
     }
-    return "opened";
+    if (typeof data?.hostName === "string" && data.hostName) {
+      savedName = data.hostName;
+    }
   } catch {
-    // Route unavailable or the open leg threw: the hand-off's new-tab
-    // fallback re-runs the same plan in a fresh app page, where the POST is
-    // idempotent.
-    return "unavailable";
+    // Route unavailable or refused: an error card, no navigation, no claim.
+    return { kind: "adoptFailed" };
   }
+  // Wake the shell's host store both ways (window events + the SDK bridge —
+  // a frame runs in its own window, so the events alone never reach the
+  // shell), so the app the user is about to open can list the record.
+  notifyShellHostsChanged();
+  return { kind: "adopted", hostLabel: savedName };
 }
 
 /**

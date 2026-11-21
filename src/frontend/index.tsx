@@ -50,7 +50,8 @@ function MonitorIcon(props: { className?: string }) {
 export function activate(app: TermixApp): void {
   // The standalone ?view= component only gets `view` + `params`; the app
   // surface rides activate (the frame's bridge). Held for the hand-off's
-  // in-view connect attempt; absent/unusable → its new-tab fallback.
+  // honest landing (list fetches, the adoption POST); absent/unusable → the
+  // view refuses in place instead of claiming anything.
   setStandaloneApp(app);
   app.registerTab(TAB_ID, createStubTab(), {
     icon: MonitorIcon,

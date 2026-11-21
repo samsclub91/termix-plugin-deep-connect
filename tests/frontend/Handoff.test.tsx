@@ -9,17 +9,23 @@ import type { ReactNode } from "react";
 // with pass-through components so text assertions stay honest.
 vi.mock("@termix-ssh/plugin-sdk/ui", () => ({
   listHostProtocols: vi.fn(() => []),
-  // The consumer module imports these two; the saved-host/null-app paths in
-  // this suite never reach them, but the import bindings must resolve.
+  // The landing resolver module imports these two; the flows in this suite
+  // never reach them, but the import bindings must resolve.
   createQuickConnectHost: vi.fn((input: Record<string, unknown>) => input),
   getDefaultConnectionTab: vi.fn(() => null),
   Button: ({
     children,
     onClick,
+    disabled,
   }: {
     children: ReactNode;
     onClick?: () => void;
-  }) => <button onClick={onClick}>{children}</button>,
+    disabled?: boolean;
+  }) => (
+    <button onClick={onClick} disabled={disabled}>
+      {children}
+    </button>
+  ),
   Card: ({ children }: { children: ReactNode }) => <div>{children}</div>,
   CardHeader: ({ children }: { children: ReactNode }) => <div>{children}</div>,
   CardTitle: ({ children }: { children: ReactNode }) => <div>{children}</div>,
@@ -30,16 +36,13 @@ vi.mock("@termix-ssh/plugin-sdk/ui", () => ({
 }));
 
 import * as ui from "@termix-ssh/plugin-sdk/ui";
-import {
-  goTarget,
-  resetGoStateForTests,
-  StandaloneHandoff,
-} from "../../src/frontend/StandaloneHandoff";
+import { StandaloneHandoff } from "../../src/frontend/StandaloneHandoff";
 import {
   renderWithApp,
   type RenderedPluginApp,
 } from "@termix-ssh/plugin-sdk/testing";
 import type {
+  PluginCredentialSummary,
   PluginHostRecord,
   TermixApp,
 } from "@termix-ssh/plugin-sdk/frontend";
@@ -56,17 +59,42 @@ const savedHost: PluginHostRecord = {
   port: 22,
 };
 
+const deployKey: PluginCredentialSummary = {
+  id: 5,
+  name: "Deploy Key",
+  username: "deploy",
+  authType: "password",
+};
+
+interface AdoptDouble {
+  /** The value the api.post resolves with (the verify target), or rejects. */
+  result?: { data: unknown };
+  reject?: boolean;
+}
+
 /**
- * A stand-in for the frame-bridged app the standalone view connects through:
- * hosts list, tab bridge and (for ad-hoc links) the api client surface.
+ * A stand-in for the frame-bridged app the landing resolves through: the
+ * live host list, the app-level credential list the resolver honors, the
+ * api client (the adoption POST) — and the TAB SPIES that must never fire:
+ * the standalone path opens sessions only inside Termix's shell, never from
+ * this page.
  */
-function makeViewApp(hosts: PluginHostRecord[]): TermixApp {
+function makeViewApp(options?: {
+  hosts?: PluginHostRecord[];
+  credentials?: PluginCredentialSummary[];
+  adopt?: AdoptDouble;
+}): TermixApp {
+  const post = vi.fn(async () => {
+    if (options?.adopt?.reject) throw new Error("adopt route refused");
+    return options?.adopt?.result ?? { data: { created: true, hostId: 42 } };
+  });
   return {
     t: (key: string, opts?: Record<string, unknown>) =>
       opts ? `${key}:${JSON.stringify(opts)}` : key,
-    listHosts: vi.fn(async () => hosts),
+    listHosts: vi.fn(async () => options?.hosts ?? [savedHost]),
+    listCredentials: vi.fn(async () => options?.credentials ?? []),
     notifyHostsChanged: vi.fn(),
-    api: { post: vi.fn() },
+    api: { post },
     tabs: {
       getLayout: vi.fn(() => ({ tabs: [] })),
       onReady: vi.fn(() => () => {}),
@@ -74,6 +102,18 @@ function makeViewApp(hosts: PluginHostRecord[]): TermixApp {
       openTab: vi.fn(),
     },
   } as unknown as TermixApp;
+}
+
+/** The tab spies of the app double, for the zero-call assertions. */
+function tabSpies(app: TermixApp): {
+  connectHost: ReturnType<typeof vi.fn>;
+  openTab: ReturnType<typeof vi.fn>;
+} {
+  const tabs = app.tabs as unknown as {
+    connectHost: ReturnType<typeof vi.fn>;
+    openTab: ReturnType<typeof vi.fn>;
+  };
+  return { connectHost: tabs.connectHost, openTab: tabs.openTab };
 }
 
 // Render the standalone through a throwaway plugin module so it gets the
@@ -101,29 +141,13 @@ async function renderHandoff(params: string) {
   });
 }
 
-describe("goTarget", () => {
-  it("keeps the grammar first-seen, adds view= and go=1, drops the rest", () => {
-    expect(
-      goTarget(
-        "?view=deep-connect&connect=H%201&type=rdp&domain=WAG&zzz=1&port=3390&using=name&credential=adm&viewonly=1",
-      ),
-    ).toBe(
-      "/?view=deep-connect&connect=H%201&type=rdp&domain=WAG&port=3390&using=name&credential=adm&viewonly=1&go=1",
-    );
-  });
-
-  it("stays well-formed without any deep-link parameters", () => {
-    expect(goTarget("?tab=x&zzz=1")).toBe("/?view=deep-connect&go=1");
-  });
-});
-
 describe("StandaloneHandoff", () => {
   beforeEach(() => {
     // Spied: every window.open below in these tests is the frame's bridged
-    // escape hatch stand-in.
+    // escape hatch stand-in (root-relative → the app page origin).
     vi.spyOn(window, "open").mockImplementation(() => null);
-    // The protocol registry must be settled for the connect paths; the
-    // refusal test below overrides it.
+    // A settled protocol registry for the link classification; the refusal
+    // test below overrides it.
     listProtocols.mockReturnValue([
       { id: "rdp", defaultPort: 3389 },
       { id: "vnc", defaultPort: 5900 },
@@ -137,8 +161,6 @@ describe("StandaloneHandoff", () => {
     vi.useRealTimers();
     window.history.replaceState(null, "", "/");
     setStandaloneApp(null);
-    resetGoStateForTests();
-    window.localStorage.removeItem("deep-connect.go-armed");
     vi.restoreAllMocks();
   });
 
@@ -163,23 +185,39 @@ describe("StandaloneHandoff", () => {
   });
 
   it("the grace timer can never bypass the confirm", async () => {
+    const app = makeViewApp();
+    setStandaloneApp(app);
     vi.useFakeTimers();
     await renderHandoff("connect=10.0.0.5&type=rdp&using=adhoc");
     await act(async () => {
       await vi.advanceTimersByTimeAsync(3000);
     });
-    // Long past the grace period: still the confirm card, nothing opened.
+    // Long past the grace period: still the confirm card, nothing resolved,
+    // nothing opened, nothing saved.
     expect(screen.getByText(locales.handoff.go)).toBeTruthy();
     expect(screen.getByText(locales.handoff.cancel)).toBeTruthy();
-    expect(screen.queryByText(locales.handoff.opening)).toBeNull();
     expect(window.open).not.toHaveBeenCalled();
+    expect(tabSpies(app).connectHost).not.toHaveBeenCalled();
+    expect(tabSpies(app).openTab).not.toHaveBeenCalled();
   });
 
-  it("refuses a doomed ad-hoc link on the confirm click", async () => {
+  it("refuses an unsupported ad-hoc type on the confirm click", async () => {
     listProtocols.mockReturnValue([] as never);
+    const app = makeViewApp();
+    setStandaloneApp(app);
     await renderHandoff("connect=10.0.0.5&type=rdp&using=adhoc");
     fireEvent.click(screen.getByText(locales.handoff.go));
-    expect(screen.getByText(locales.handoff.noPlugin)).toBeTruthy();
+    // The unfilled registry settles within the landing's budget, then the
+    // plain refusal card shows — post, tabs and windows untouched.
+    await waitFor(
+      () => expect(screen.getByText(locales.handoff.noPlugin)).toBeTruthy(),
+      { timeout: 5000 },
+    );
+    expect(tabSpies(app).connectHost).not.toHaveBeenCalled();
+    expect(tabSpies(app).openTab).not.toHaveBeenCalled();
+    expect(
+      (app.api as unknown as { post: ReturnType<typeof vi.fn> }).post,
+    ).not.toHaveBeenCalled();
     expect(window.open).not.toHaveBeenCalled();
   });
 
@@ -189,95 +227,224 @@ describe("StandaloneHandoff", () => {
     expect(screen.getByText(locales.handoff.cancelled)).toBeTruthy();
   });
 
-  it("connects a saved host in place and shows the session-opened state", async () => {
-    const app = makeViewApp([savedHost]);
+  it("lands a saved host honestly: no connect call, one app-root tab", async () => {
+    const app = makeViewApp({ hosts: [savedHost] });
+    setStandaloneApp(app);
+    await renderHandoff("connect=Web%20Server%201");
+    fireEvent.click(screen.getByText(locales.handoff.go));
+    // The truthful finish: Termix opens in a new tab with the record ready,
+    // and the card says the page itself cannot open sessions.
+    await waitFor(() =>
+      expect(screen.getByText(locales.handoff.finishTitle)).toBeTruthy(),
+    );
+    expect(screen.getByText(locales.handoff.openTermix)).toBeTruthy();
+    expect(
+      screen.getByText(
+        locales.handoff.finishSaved.replace("{{host}}", "Web Server 1"),
+      ),
+    ).toBeTruthy();
+    expect(document.body.textContent).toContain(
+      "this page cannot open sessions",
+    );
+    // The landing tab rides the click, root-relative, exactly one.
+    expect(window.open).toHaveBeenCalledTimes(1);
+    expect(window.open).toHaveBeenCalledWith("/", "_blank");
+    // The standalone path NEVER dispatches a session: the tab bridge is
+    // dead on this page and its failures are unobservable.
+    expect(tabSpies(app).connectHost).not.toHaveBeenCalled();
+    expect(tabSpies(app).openTab).not.toHaveBeenCalled();
+  });
+
+  it("the landing card's [Open Termix] is the manual path", async () => {
+    const app = makeViewApp({ hosts: [savedHost] });
     setStandaloneApp(app);
     await renderHandoff("connect=Web%20Server%201");
     fireEvent.click(screen.getByText(locales.handoff.go));
     await waitFor(() =>
-      expect(screen.getByText(locales.handoff.sessionOpened)).toBeTruthy(),
+      expect(screen.getByText(locales.handoff.openTermix)).toBeTruthy(),
     );
-    const connectHost = (
-      app.tabs as unknown as { connectHost: ReturnType<typeof vi.fn> }
-    ).connectHost;
-    expect(connectHost).toHaveBeenCalledTimes(1);
-    expect(connectHost).toHaveBeenCalledWith(savedHost, undefined);
-    expect(window.open).not.toHaveBeenCalled();
+    const bridge = window.open as ReturnType<typeof vi.fn>;
+    const afterLanding = bridge.mock.calls.length;
+    fireEvent.click(screen.getByText(locales.handoff.openTermix));
+    expect(window.open).toHaveBeenCalledTimes(afterLanding + 1);
+    expect((window.open as ReturnType<typeof vi.fn>).mock.calls.at(-1)).toEqual(
+      ["/", "_blank"],
+    );
+    expect(tabSpies(app).connectHost).not.toHaveBeenCalled();
   });
 
-  it("falls back to one go=1 new tab when no app surface exists", async () => {
+  it("adopts a credentialed ad-hoc link: verified POST, then landing", async () => {
+    const app = makeViewApp({
+      credentials: [deployKey],
+      adopt: { result: { data: { created: true, hostId: 42 } } },
+    });
+    setStandaloneApp(app);
+    await renderHandoff(
+      new URLSearchParams({
+        connect: "10.0.0.5",
+        type: "vnc",
+        credential: "Deploy Key",
+        using: "adhoc",
+      }).toString(),
+    );
+    fireEvent.click(screen.getByText(locales.handoff.go));
+    await waitFor(() =>
+      expect(screen.getByText(locales.handoff.finishTitle)).toBeTruthy(),
+    );
+    const post = (app.api as unknown as { post: ReturnType<typeof vi.fn> })
+      .post;
+    expect(post).toHaveBeenCalledTimes(1);
+    expect(post).toHaveBeenCalledWith("/adopt", {
+      hostName: "10.0.0.5",
+      type: "vnc",
+      credentialId: 5,
+      port: 5900,
+    });
+    // The tab opens only AFTER the verified response: adoption first,
+    // landing second, in that order.
+    const bridge = window.open as ReturnType<typeof vi.fn>;
+    expect(bridge.mock.calls.length).toBe(1);
+    expect(bridge.mock.calls[0]).toEqual(["/", "_blank"]);
+    expect(post.mock.invocationCallOrder[0]).toBeLessThan(
+      bridge.mock.invocationCallOrder[0],
+    );
+    expect(
+      screen.getByText(
+        locales.handoff.finishAdopted.replace("{{host}}", "10.0.0.5"),
+      ),
+    ).toBeTruthy();
+    expect(tabSpies(app).connectHost).not.toHaveBeenCalled();
+    expect(tabSpies(app).openTab).not.toHaveBeenCalled();
+  });
+
+  it("no 'saved' claim and no tab when the adoption POST fails", async () => {
+    const app = makeViewApp({
+      credentials: [deployKey],
+      adopt: { reject: true },
+    });
+    setStandaloneApp(app);
+    await renderHandoff(
+      new URLSearchParams({
+        connect: "10.0.0.5",
+        type: "vnc",
+        credential: "Deploy Key",
+        using: "adhoc",
+      }).toString(),
+    );
+    fireEvent.click(screen.getByText(locales.handoff.go));
+    await waitFor(() =>
+      expect(screen.getByText(locales.handoff.adoptFailedTitle)).toBeTruthy(),
+    );
+    expect(screen.getByText(locales.handoff.adoptFailed)).toBeTruthy();
+    // A failed save is the end: no navigation, no "Session opened" claim.
+    expect(window.open).not.toHaveBeenCalled();
+    expect(tabSpies(app).connectHost).not.toHaveBeenCalled();
+    expect(tabSpies(app).openTab).not.toHaveBeenCalled();
+  });
+
+  it("verifies the adoption response: 2xx without a host id fails", async () => {
+    const app = makeViewApp({
+      credentials: [deployKey],
+      adopt: { result: { data: { created: false } } },
+    });
+    setStandaloneApp(app);
+    await renderHandoff(
+      new URLSearchParams({
+        connect: "10.0.0.5",
+        type: "vnc",
+        credential: "Deploy Key",
+        using: "adhoc",
+      }).toString(),
+    );
+    fireEvent.click(screen.getByText(locales.handoff.go));
+    await waitFor(() =>
+      expect(screen.getByText(locales.handoff.adoptFailedTitle)).toBeTruthy(),
+    );
+    expect(window.open).not.toHaveBeenCalled();
+    expect(tabSpies(app).openTab).not.toHaveBeenCalled();
+  });
+
+  it("refuses a credential-less ad-hoc link in place: no adopt, no tab", async () => {
+    const app = makeViewApp();
+    setStandaloneApp(app);
+    await renderHandoff("connect=10.0.0.5&type=vnc&using=adhoc");
+    fireEvent.click(screen.getByText(locales.handoff.go));
+    await waitFor(() =>
+      expect(screen.getByText(locales.handoff.cannotAdoptTitle)).toBeTruthy(),
+    );
+    expect(screen.getByText(locales.handoff.cannotAdopt)).toBeTruthy();
+    // Refusal means refusal: no adoption POST, no window, no session — and
+    // the manual path is the card's only button.
+    const post = (app.api as unknown as { post: ReturnType<typeof vi.fn> })
+      .post;
+    expect(post).not.toHaveBeenCalled();
+    expect(window.open).not.toHaveBeenCalled();
+    expect(tabSpies(app).connectHost).not.toHaveBeenCalled();
+    expect(tabSpies(app).openTab).not.toHaveBeenCalled();
+    expect(screen.getByText(locales.handoff.openTermix)).toBeTruthy();
+  });
+
+  it("refuses in place when the app surface is missing: no tab, manual path", async () => {
     setStandaloneApp(null);
     await renderHandoff("connect=H1&type=rdp");
     fireEvent.click(screen.getByText(locales.handoff.go));
     await waitFor(() =>
-      expect(screen.getByText(locales.handoff.fallbackNote)).toBeTruthy(),
+      expect(screen.getByText(locales.handoff.noSurfaceTitle)).toBeTruthy(),
     );
+    // Nothing ran with the outcome unknown: no window before a resolution.
+    expect(window.open).not.toHaveBeenCalled();
+    // The manual [Open Termix] is the way out, and it bridges on click.
+    fireEvent.click(screen.getByText(locales.handoff.openTermix));
     expect(window.open).toHaveBeenCalledTimes(1);
-    expect(window.open).toHaveBeenCalledWith(
-      "/?view=deep-connect&connect=H1&type=rdp&go=1",
-      "_blank",
-    );
-    expect(screen.queryByText(locales.handoff.sessionOpened)).toBeNull();
+    expect(window.open).toHaveBeenCalledWith("/", "_blank");
   });
 
-  it("cannot be skipped by a bare go=1 link: no marker, no auto-consume", async () => {
-    const app = makeViewApp([savedHost]);
+  it("reports a missing saved host as an error card with no navigation", async () => {
+    const ghost = makeViewApp({ hosts: [] });
+    setStandaloneApp(ghost);
+    await renderHandoff("connect=ghost");
+    fireEvent.click(screen.getByText(locales.handoff.go));
+    await waitFor(() =>
+      expect(screen.getByText("No saved host matches ghost.")).toBeTruthy(),
+    );
+    expect(screen.getByText(locales.handoff.connectFailedHint)).toBeTruthy();
+    expect(window.open).not.toHaveBeenCalled();
+    expect(tabSpies(ghost).connectHost).not.toHaveBeenCalled();
+    expect(tabSpies(ghost).openTab).not.toHaveBeenCalled();
+  });
+
+  it("reports a missing credential as an error card with no navigation", async () => {
+    const noCred = makeViewApp({ credentials: [] });
+    setStandaloneApp(noCred);
+    await renderHandoff(
+      new URLSearchParams({
+        connect: "10.0.0.5",
+        type: "vnc",
+        credential: "Ghost",
+        using: "adhoc",
+      }).toString(),
+    );
+    fireEvent.click(screen.getByText(locales.handoff.go));
+    await waitFor(() =>
+      expect(screen.getByText("No saved credential named Ghost.")).toBeTruthy(),
+    );
+    expect(screen.getByText(locales.handoff.connectFailedHint)).toBeTruthy();
+    expect(window.open).not.toHaveBeenCalled();
+    expect(tabSpies(noCred).connectHost).not.toHaveBeenCalled();
+    expect(tabSpies(noCred).openTab).not.toHaveBeenCalled();
+  });
+
+  it("a crafted go=1 link is just an ordinary grammar link", async () => {
+    const app = makeViewApp();
     setStandaloneApp(app);
-    await renderHandoff("connect=Web%20Server%201&go=1");
-    await waitFor(() =>
-      expect(screen.getByText(locales.handoff.go)).toBeTruthy(),
-    );
-    // A crafted URL without the armed marker lands on the confirm card.
-    const connectHost = (
-      app.tabs as unknown as { connectHost: ReturnType<typeof vi.fn> }
-    ).connectHost;
-    expect(connectHost).not.toHaveBeenCalled();
+    await renderHandoff("connect=10.0.0.5&go=1");
+    // No armed-marker machinery left: the confirm card shows, nothing runs.
+    expect(screen.getByText(locales.handoff.go)).toBeTruthy();
     expect(window.open).not.toHaveBeenCalled();
-  });
-
-  it("an armed go=1 auto-consumes once and never re-windows", async () => {
-    const app = makeViewApp([savedHost]);
-    setStandaloneApp(app);
-    window.localStorage.setItem("deep-connect.go-armed", "1");
-    await renderHandoff("connect=Web%20Server%201&go=1");
-    await waitFor(() =>
-      expect(screen.getByText(locales.handoff.sessionOpened)).toBeTruthy(),
-    );
-    const connectHost = (
-      app.tabs as unknown as { connectHost: ReturnType<typeof vi.fn> }
-    ).connectHost;
-    expect(connectHost).toHaveBeenCalledTimes(1);
-    expect(window.open).not.toHaveBeenCalled();
-    // The one-shot marker is spent with the auto-consume.
-    expect(window.localStorage.getItem("deep-connect.go-armed")).toBeNull();
-
-    // A second armed delivery in the same page shares the first run: the
-    // auto-consume executes at most once per module life and opens nothing.
-    window.localStorage.setItem("deep-connect.go-armed", "1");
-    await renderHandoff("connect=Web%20Server%201&go=1");
-    await waitFor(() =>
-      expect(screen.getByText(locales.handoff.sessionOpened)).toBeTruthy(),
-    );
-    expect(connectHost).toHaveBeenCalledTimes(1);
-    expect(window.open).not.toHaveBeenCalled();
-  });
-
-  it("an armed go=1 with a missing surface ends in the error card", async () => {
-    setStandaloneApp(null);
-    window.localStorage.setItem("deep-connect.go-armed", "1");
-    await renderHandoff("connect=H1&go=1");
-    await waitFor(() =>
-      expect(screen.getByText(locales.deepLink.connectFailed)).toBeTruthy(),
-    );
-    // The go=1 view NEVER opens another window: failures dead-end here.
-    expect(window.open).not.toHaveBeenCalled();
-  });
-
-  it("a go=1 link without a connect parameter shows the empty state", async () => {
-    window.localStorage.setItem("deep-connect.go-armed", "1");
-    await renderHandoff("go=1");
-    expect(screen.getByText(locales.handoff.noPayload)).toBeTruthy();
-    expect(window.open).not.toHaveBeenCalled();
+    expect(tabSpies(app).connectHost).not.toHaveBeenCalled();
+    expect(tabSpies(app).openTab).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByText(locales.handoff.cancel));
+    expect(screen.getByText(locales.handoff.cancelled)).toBeTruthy();
   });
 
   it("keeps window.location.search out of the standalone path entirely", () => {
@@ -288,5 +455,34 @@ describe("StandaloneHandoff", () => {
     // The frame's location.search is always empty in a sandbox; the params
     // ride props. Any read of location.search here would consume nothing.
     expect(source.includes("location.search")).toBe(false);
+  });
+
+  it("the standalone path never calls the tab bridge and never claims a session", () => {
+    // Source-level guard: no tab bridge call, no go=1 machinery, and no
+    // "Session opened" claim can come back into the standalone component.
+    const source = readFileSync(
+      resolve(process.cwd(), "src/frontend/StandaloneHandoff.tsx"),
+      "utf8",
+    );
+    for (const banned of [
+      "connectHost",
+      "openTab",
+      "go=1",
+      "go-armed",
+      "goTarget",
+      "fallbackNote",
+      "sessionOpened",
+    ]) {
+      expect(source.includes(banned)).toBe(false);
+    }
+    // And the locale file has no session-opened claims left either.
+    const en = readFileSync(resolve(process.cwd(), "locales/en.json"), "utf8");
+    for (const banned of [
+      '"sessionOpened"',
+      '"fallbackNote"',
+      "Session opened",
+    ]) {
+      expect(en.includes(banned)).toBe(false);
+    }
   });
 });
