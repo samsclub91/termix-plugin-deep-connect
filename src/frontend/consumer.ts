@@ -13,6 +13,7 @@ import type {
 } from "@termix-ssh/plugin-sdk/frontend";
 import {
   parseDeepLinkConnect,
+  parseTermixLinkUrl,
   stripDeepLinkParams,
   type DeepLinkConnectIntent,
 } from "./deep-link";
@@ -39,6 +40,12 @@ import {
  * The URL is scrubbed of deep-link parameters before anything else happens,
  * so a refresh can never retrigger a consumed intent, and the consumed flag
  * is module-scoped so a disable/enable cycle cannot parse twice.
+ *
+ * Desktop `termix://` links (app.deepLinks, Termix 26.11.3) run through the
+ * SAME plan and the SAME confirm: startTermixLinkConsumer parses each link
+ * with parseTermixLinkUrl and feeds the shared runner below. The OS scheme is
+ * attacker-reachable, so a link opens nothing and writes nothing before its
+ * confirm is accepted — for both sources, "os-scheme" and "command-line".
  */
 export interface DeepLinkConsumerSettings {
   /** Milliseconds to wait for the host list and protocol registry to settle. */
@@ -59,11 +66,27 @@ export interface DeepLinkConsumerSettings {
   adoptApi?: () => PluginApiClient;
 }
 
+interface ResolvedSettings {
+  settleBudgetMs: number;
+  pollMs: number;
+  defaultTabBudgetMs: number;
+  adoptApi?: DeepLinkConsumerSettings["adoptApi"];
+}
+
 const DEFAULT_SETTLE_BUDGET_MS = 4000;
 const DEFAULT_POLL_MS = 100;
 const DEFAULT_TAB_BUDGET_MS = 2000;
 
-/** Module-scoped guard: one intent per page load, even across re-activates. */
+function resolveSettings(options: DeepLinkConsumerSettings): ResolvedSettings {
+  return {
+    settleBudgetMs: options.settleBudgetMs ?? DEFAULT_SETTLE_BUDGET_MS,
+    pollMs: options.pollMs ?? DEFAULT_POLL_MS,
+    defaultTabBudgetMs: options.defaultTabBudgetMs ?? DEFAULT_TAB_BUDGET_MS,
+    adoptApi: options.adoptApi,
+  };
+}
+
+/** Module-scoped guard: one search-param intent per page load, even across re-activates. */
 let consumed = false;
 
 function shellReady(app: TermixApp): Promise<void> {
@@ -82,8 +105,9 @@ function shellReady(app: TermixApp): Promise<void> {
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
- * Runs the full consume pipeline once the shell is ready and the registries
- * settled. Exported only for tests; use {@link startDeepLinkConsumer}.
+ * Runs the full consume pipeline for one parsed browser search string once
+ * the shell is ready and the registries settled. Kept as the search-string
+ * entry the tests drive: parse, then the shared intent runner.
  */
 export async function consumeDeepLink(
   app: TermixApp,
@@ -97,6 +121,24 @@ export async function consumeDeepLink(
 ): Promise<void> {
   const intent = parseDeepLinkConnect(search);
   if (!intent) return;
+  await runConnectIntent(app, intent, {
+    settleBudgetMs: settings.settleBudgetMs,
+    pollMs: settings.pollMs,
+    defaultTabBudgetMs: settings.defaultTabBudgetMs,
+    adoptApi: settings.adoptApi,
+  });
+}
+
+/**
+ * Runs the full consume pipeline for one parsed intent once the shell is
+ * ready and the registries settled. Shared by the browser search consumer
+ * and the desktop termix:// link consumer. Exported only for tests.
+ */
+export async function runConnectIntent(
+  app: TermixApp,
+  intent: DeepLinkConnectIntent,
+  settings: ResolvedSettings,
+): Promise<void> {
   const t = app.t;
 
   await shellReady(app);
@@ -201,7 +243,7 @@ async function maybeEnsureSavedHost(
   app: TermixApp,
   plan: ConnectPlan,
   intent: DeepLinkConnectIntent,
-  settings: { pollMs: number; defaultTabBudgetMs: number; adoptApi?: DeepLinkConsumerSettings["adoptApi"] },
+  settings: ResolvedSettings,
 ): Promise<boolean> {
   const t = app.t;
   const type = intent.type;
@@ -293,18 +335,14 @@ async function maybeEnsureSavedHost(
   // current.
   // One beat for the store reload we just triggered to land.
   await sleep(300);
-  app.tabs.openTab(
-    host as PluginHostRecord,
-    type,
-    { label: hostLabel },
-  );
+  app.tabs.openTab(host as PluginHostRecord, type, { label: hostLabel });
   return true;
 }
 
 async function confirmAndConnect(
   app: TermixApp,
   plan: ConnectPlan,
-  settings: { pollMs: number; defaultTabBudgetMs: number; adoptApi?: DeepLinkConsumerSettings["adoptApi"] },
+  settings: ResolvedSettings,
   intent?: DeepLinkConnectIntent,
 ): Promise<void> {
   const t = app.t;
@@ -315,8 +353,15 @@ async function confirmAndConnect(
     if (outcome === "handled") return;
     // The create was unavailable (fallback): the ad-hoc quick connect under
     // the plan still runs — the interactive session instead of the saved one.
-    // Surface the credential as not carried, same as plan v1 would.
-    if (dialog.credential && !dialog.credentialNotCarried) {
+    // Surface the credential as not carried ONLY when it does not already
+    // ride by id: a plugin-protocol fallback record carries
+    // quickConnectLogin.credentialId and the server resolves the login,
+    // so there is nothing to prompt for.
+    if (
+      dialog.credential &&
+      !dialog.credentialNotCarried &&
+      !dialog.credentialRides
+    ) {
       dialog.credentialNotCarried = {
         name: dialog.credential.name,
         protocol: adopt.type,
@@ -349,16 +394,14 @@ async function confirmAdoptAndConnect(
   app: TermixApp,
   adopt: AdoptRequest,
   dialog: NonNullable<ConnectPlan["dialog"]>,
-  settings: { pollMs: number; defaultTabBudgetMs: number; adoptApi?: DeepLinkConsumerSettings["adoptApi"] },
+  settings: ResolvedSettings,
 ): Promise<AdoptOutcome> {
   const t = app.t;
   if (!dialog.credential) return "fallback";
   // The app object the shell hands to activate carries a non-hook API client
   // (usePluginApi() is a React hook and throws in module-scope code like
   // this), so route POSTs go through `app.api`.
-  const api = (settings.adoptApi?.() ?? app.api) as
-    | PluginApiClient
-    | undefined;
+  const api = (settings.adoptApi?.() ?? app.api) as PluginApiClient | undefined;
   if (!api || typeof api.post !== "function") return "fallback";
 
   const ok = await app.confirm({
@@ -450,6 +493,8 @@ async function confirmAdoptAndConnect(
       address: String(hostToConnect.ip ?? label),
       credential: dialog.credential,
       viewOnly: dialog.viewOnly,
+      // The saved flow's session rides the host record, not the link: the
+      // view-only request stays a NOTE on this path (see connect-plan).
     },
   };
   await connectResolvedPlan(app, savedPlan, settings, /* confirmFirst */ false);
@@ -464,7 +509,7 @@ async function confirmAdoptAndConnect(
 async function connectResolvedPlan(
   app: TermixApp,
   plan: ConnectPlan,
-  settings: { pollMs: number; defaultTabBudgetMs: number },
+  settings: ResolvedSettings,
   confirmFirst: boolean,
 ): Promise<void> {
   const t = app.t;
@@ -480,16 +525,25 @@ async function connectResolvedPlan(
           : t("deepLink.credentialNote", { name: dialog.credential.name }),
       );
     }
-    if (dialog.credentialNotCarried) {
+    if (!dialog.saved && dialog.credential) {
       parts.push(
-        t("deepLink.adhocCredentialNote", {
-          name: dialog.credentialNotCarried.name,
-          protocol: (dialog.credentialNotCarried.protocol ?? "ssh") as string,
-        }),
+        dialog.credentialNotCarried
+          ? t("deepLink.adhocCredentialNote", {
+              name: dialog.credentialNotCarried.name,
+              protocol: (dialog.credentialNotCarried.protocol ??
+                "ssh") as string,
+            })
+          : t("deepLink.credentialNote", { name: dialog.credential.name }),
       );
     }
     if (dialog.viewOnly) {
-      parts.push(t("deepLink.viewOnlyNote"));
+      parts.push(
+        t(
+          dialog.viewOnlyApplied
+            ? "deepLink.viewOnlyNote"
+            : "deepLink.viewOnlySavedNote",
+        ),
+      );
     }
     const ok = await app.confirm({
       title: t(dialog.saved ? "deepLink.confirmTitle" : "deepLink.adhocTitle", {
@@ -529,9 +583,10 @@ async function connectResolvedPlan(
 }
 
 /**
- * Registers the activate-time consumer. Call once from `activate`. No-ops on
- * a standalone `?view=` page (the hand-off component owns that URL), without
- * a connect parameter, or when an intent was already consumed.
+ * Registers the activate-time consumer for browser `?connect=` links. Call
+ * once from `activate`. No-ops on a standalone `?view=` page (the hand-off
+ * component owns that URL), without a connect parameter, or when an intent
+ * was already consumed.
  */
 export function startDeepLinkConsumer(
   app: TermixApp,
@@ -559,12 +614,38 @@ export function startDeepLinkConsumer(
   const intent = parseDeepLinkConnect(search);
   if (!intent) return;
   consumed = true;
-  void consumeDeepLink(app, search, {
-    settleBudgetMs: options.settleBudgetMs ?? DEFAULT_SETTLE_BUDGET_MS,
-    pollMs: options.pollMs ?? DEFAULT_POLL_MS,
-    defaultTabBudgetMs: options.defaultTabBudgetMs ?? DEFAULT_TAB_BUDGET_MS,
-    adoptApi: options.adoptApi,
+  void runConnectIntent(app, intent, resolveSettings(options));
+}
+
+/**
+ * Registers the activate-time consumer for desktop `termix://` links
+ * (app.deepLinks, Termix 26.11.3). No-op when the shell does not expose the
+ * seam (a web browser never has termix:// links — `app.deepLinks` is
+ * undefined there). Core replays links that arrived before registration, so
+ * a link the desktop app was opened with still lands; links run one at a
+ * time in arrival order, and EVERY parsed link still confirms first. Core's
+ * own termix://host/<id> form is core's — parseTermixLinkUrl ignores it.
+ */
+export function startTermixLinkConsumer(
+  app: TermixApp,
+  options: DeepLinkConsumerSettings = {},
+): void {
+  const deepLinks = app.deepLinks;
+  if (!deepLinks || typeof deepLinks.onOpen !== "function") return;
+  const settings = resolveSettings(options);
+  let chain: Promise<void> = Promise.resolve();
+  const disposer = deepLinks.onOpen((link) => {
+    const intent = parseTermixLinkUrl(link?.url ?? "");
+    if (!intent) return; // termix://host/<id> and anything unparsable
+    chain = chain.then(async () => {
+      try {
+        await runConnectIntent(app, intent, settings);
+      } catch {
+        // One failed link must not poison the queue for the next one.
+      }
+    });
   });
+  app.onDispose?.(disposer);
 }
 
 /** Test seam: forget the module-scoped consumption guard. */

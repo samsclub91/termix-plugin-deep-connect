@@ -1,5 +1,18 @@
 # Changelog
 
+## 2.0.0
+
+### Changed
+
+- Ported to plugin API 2 (engine.api `"2"`, `@termix-ssh/plugin-sdk` 2.11.0); requires Termix 26.11.3. API-1 manifests stopped loading on Termix 26.11.2, hence the major bump; nothing about link behavior changed with it
+- Ad-hoc RDP/VNC links name a credential (`credential=<name>`): the quick connect now carries it by id (`quickConnectLogin.credentialId`) and the remote-desktop plugin resolves it server-side — no username or password rides the link, and its secret never reaches the browser. Ad-hoc SSH keeps the 1.2 behavior exactly (a saved credential still cannot ride a quick SSH connect; its username does, and the session prompts). When the named credential does not exist, every type falls back to the 1.2 behavior
+- Adopting an ad-hoc RDP/VNC link falls back to a quick connect that also carries the credential by id, instead of the old "will be asked for in the session" path; the note about being prompted is gone there
+
+### Added
+
+- `viewonly=1` now applies: ad-hoc RDP/VNC quick connects open with the session's input off (`quickConnectLogin.viewOnly`). It stays restrict-only — the parameter is accepted exactly as `1` and can only turn input off, never on; every other value is ignored. Saved hosts and SSH links still read the note without acting on it
+- Desktop app `termix://` links (`app.deepLinks`, Termix 26.11.3) connect through the same grammar: `termix://connect/<target>?type=…` and `termix://…?connect=…&type=…&…` forms reach the same plan, the same confirm and the same connect path as browser `?connect=` links. Core's own `termix://host/<id>` form is left to Termix, and every `termix://` connect still confirms first — the OS scheme is reachable from anywhere, so nothing opens without your click
+
 ## 1.2.0
 
 ### Changed

@@ -43,6 +43,7 @@ import {
   consumeDeepLink,
   resetDeepLinkConsumerForTests,
   startDeepLinkConsumer,
+  startTermixLinkConsumer,
 } from "../../src/frontend/consumer";
 
 const listProtocols = vi.mocked(ui.listHostProtocols);
@@ -59,12 +60,18 @@ const credentials: PluginCredentialSummary[] = [
   { id: 7, name: "Deploy Key", username: "deploy", authType: "password" },
 ];
 
+interface TestLink {
+  url: string;
+  source: "os-scheme" | "command-line";
+}
+
 interface AppDouble {
   app: TermixApp;
   confirm: ReturnType<typeof vi.fn>;
   listHosts: ReturnType<typeof vi.fn>;
   connectHost: ReturnType<typeof vi.fn>;
   openTab: ReturnType<typeof vi.fn>;
+  onOpen: ReturnType<typeof vi.fn>;
   fireReady: () => void;
   t: (key: string, opts?: Record<string, unknown>) => string;
 }
@@ -73,12 +80,20 @@ function makeApp(options?: {
   hosts?: PluginHostRecord[];
   credentials?: PluginCredentialSummary[];
   confirmResult?: boolean;
+  /** Queued termix:// links replayed to the listener on registration. */
+  queuedLinks?: TestLink[];
 }): AppDouble {
   const onReadyListeners: (() => void)[] = [];
   const t = (key: string, opts?: Record<string, unknown>) =>
     opts ? `${key}:${JSON.stringify(opts)}` : key;
   const confirm = vi.fn(async () => options?.confirmResult ?? true);
   const listHosts = vi.fn(async () => options?.hosts ?? hosts);
+  const onOpen = vi.fn((listener: (link: TestLink) => void): (() => void) => {
+    for (const link of options?.queuedLinks ?? []) {
+      listener(link);
+    }
+    return () => {};
+  });
   const app = {
     pluginId: "deep-connect",
     t,
@@ -96,6 +111,7 @@ function makeApp(options?: {
       connectHost: vi.fn(),
       openTab: vi.fn(),
     },
+    ...(options?.queuedLinks ? { deepLinks: { onOpen } } : {}),
   } as unknown as TermixApp;
   return {
     app,
@@ -104,6 +120,7 @@ function makeApp(options?: {
     connectHost: app.tabs.connectHost as never,
     openTab: (app.tabs as unknown as { openTab: ReturnType<typeof vi.fn> })
       .openTab,
+    onOpen,
     fireReady: () => onReadyListeners.forEach((listener) => listener()),
     t,
   };
@@ -119,10 +136,16 @@ function adoptSettings(
   api: {
     post: ReturnType<typeof vi.fn>;
   } | null,
-): { settleBudgetMs: number; pollMs: number; defaultTabBudgetMs: number; adoptApi: () => PluginApiClient } {
+): {
+  settleBudgetMs: number;
+  pollMs: number;
+  defaultTabBudgetMs: number;
+  adoptApi: () => PluginApiClient;
+} {
   return {
     ...SETTINGS,
-    adoptApi: () => (api ? { post: api as unknown } : null) as unknown as PluginApiClient,
+    adoptApi: () =>
+      (api ? { post: api as unknown } : null) as unknown as PluginApiClient,
   };
 }
 
@@ -244,7 +267,58 @@ describe("consumeDeepLink", () => {
     expect(post).not.toHaveBeenCalled();
   });
 
-  it("adds the viewonly note without applying view-only", async () => {
+  it("carries an ad-hoc rdp/vnc credential by id on the quick connect", async () => {
+    // The route IS injected but refuses (adopt unavailable): the fallback
+    // quick connect now carries the credential by id, so there is no
+    // not-carried note and no prompt story.
+    post.mockRejectedValue(new Error("route gone"));
+    const double = makeApp();
+    defaultTab.mockReturnValue(null as never);
+    vi.useFakeTimers();
+    const task = consumeDeepLink(
+      double.app,
+      "?connect=10.0.0.5&type=vnc&credential=deploy%20key",
+      adoptSettings(credentialState.post as never),
+    );
+    await vi.advanceTimersByTimeAsync(400);
+    await task;
+    expect(toastError).toHaveBeenCalledWith("deepLink.adoptUnavailable");
+    expect(double.confirm).toHaveBeenCalledTimes(2);
+    const fallbackArgs = double.confirm.mock.calls[1][0];
+    expect(fallbackArgs.description).toContain("deepLink.credentialNote");
+    expect(fallbackArgs.description).not.toContain(
+      "deepLink.adhocCredentialNote",
+    );
+    expect(quickConnect).toHaveBeenCalledWith(
+      expect.objectContaining({ ip: "10.0.0.5", port: 5900 }),
+    );
+    const host = double.connectHost.mock.calls[0][0] as Record<string, unknown>;
+    const login = host.quickConnectLogin as Record<string, unknown>;
+    expect(login).toMatchObject({ protocol: "vnc", credentialId: 7 });
+    expect("username" in login).toBe(false);
+    expect("password" in login).toBe(false);
+  });
+
+  it("applies viewonly=1 on an ad-hoc plugin-protocol quick connect", async () => {
+    const double = makeApp();
+    vi.useFakeTimers();
+    const task = consumeDeepLink(
+      double.app,
+      "?connect=10.0.0.5&type=vnc&viewonly=1",
+      SETTINGS,
+    );
+    await vi.advanceTimersByTimeAsync(400);
+    await task;
+    const host = double.connectHost.mock.calls[0][0] as Record<string, unknown>;
+    const login = host.quickConnectLogin as Record<string, unknown>;
+    expect(login.viewOnly).toBe(true);
+    expect(login.protocol).toBe("vnc");
+    const description = double.confirm.mock.calls[0][0].description as string;
+    expect(description).toContain("deepLink.viewOnlyNote");
+    expect(description).not.toContain("deepLink.viewOnlySavedNote");
+  });
+
+  it("adds the viewonly note without applying view-only on ssh links", async () => {
     const double = makeApp();
     vi.useFakeTimers();
     const task = consumeDeepLink(
@@ -256,9 +330,13 @@ describe("consumeDeepLink", () => {
     await task;
     expect(
       (double.confirm.mock.calls[0][0].description as string).includes(
-        "deepLink.viewOnlyNote",
+        "deepLink.viewOnlySavedNote",
       ),
     ).toBe(true);
+    // SSH quick connects never carry a quickConnectLogin.
+    expect(quickConnect.mock.calls[0][0]).not.toHaveProperty(
+      "quickConnectLogin",
+    );
   });
 
   it("creates and reconnects through the saved flow when the user confirms adoption", async () => {
@@ -289,12 +367,14 @@ describe("consumeDeepLink", () => {
     // The confirm ran before the create: the adopt dialog, with its own keys.
     expect(double.confirm).toHaveBeenCalledTimes(1);
     const dialog = double.confirm.mock.calls[0][0];
-    expect(dialog.title).toBe(double.t("deepLink.adoptTitle", { host: "10.0.0.5" }));
+    expect(dialog.title).toBe(
+      double.t("deepLink.adoptTitle", { host: "10.0.0.5" }),
+    );
     expect(dialog.confirmLabel).toBe("deepLink.adoptAction");
     expect(dialog.description).toContain("deepLink.adoptDescription");
     // The real en.json text carries the folder name; the double's t() only
     // renders params, so assert the interpolation payload.
-    expect(dialog.description).toContain('"name":"Deploy Key"');
+    expect(dialog.description).toContain('\"name\":\"Deploy Key\"');
     expect(post).toHaveBeenCalledWith("/adopt", {
       hostName: "10.0.0.5",
       type: "ssh",
@@ -397,11 +477,9 @@ describe("consumeDeepLink", () => {
       // route resolves the link protocol's default server-side.
       sshOff: true,
     });
-    expect(double.openTab).toHaveBeenCalledWith(
-      pluginMade,
-      "vnc",
-      { label: "192.168.103.99" },
-    );
+    expect(double.openTab).toHaveBeenCalledWith(pluginMade, "vnc", {
+      label: "192.168.103.99",
+    });
     expect(double.connectHost).not.toHaveBeenCalled();
   });
 
@@ -434,11 +512,9 @@ describe("consumeDeepLink", () => {
       credentialId: 7,
     });
     expect(post.mock.calls[0][0]).not.toHaveProperty("sshOff");
-    expect(double.openTab).toHaveBeenCalledWith(
-      userHost,
-      "vnc",
-      { label: "wag-server01" },
-    );
+    expect(double.openTab).toHaveBeenCalledWith(userHost, "vnc", {
+      label: "wag-server01",
+    });
     expect(toastSuccess).toHaveBeenCalledWith(
       double.t("deepLink.adoptUpdated", { host: "wag-server01" }),
     );
@@ -472,11 +548,9 @@ describe("consumeDeepLink", () => {
       port: 33389,
       sshOff: true,
     });
-    expect(double.openTab).toHaveBeenCalledWith(
-      pluginMade,
-      "rdp",
-      { label: "wag-itvm15" },
-    );
+    expect(double.openTab).toHaveBeenCalledWith(pluginMade, "rdp", {
+      label: "wag-itvm15",
+    });
   });
 
   it("leaves a user-shaped record alone when it already has the protocol login", async () => {
@@ -689,5 +763,139 @@ describe("startDeepLinkConsumer", () => {
     await vi.advanceTimersByTimeAsync(100);
     expect(double.confirm).toHaveBeenCalledTimes(1);
     expect(double.connectHost).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("startTermixLinkConsumer", () => {
+  function linkSettings() {
+    return {
+      settleBudgetMs: 200,
+      pollMs: 10,
+      defaultTabBudgetMs: 100,
+    };
+  }
+
+  it("no-ops when the shell does not expose the deepLinks seam", () => {
+    const double = makeApp();
+    startTermixLinkConsumer(double.app, linkSettings());
+    expect(double.confirm).not.toHaveBeenCalled();
+    // The registration never even reached a listener.
+    expect(double.onOpen).not.toHaveBeenCalled();
+  });
+
+  it("connects a query-form link through the same grammar and confirm", async () => {
+    const double = makeApp({
+      queuedLinks: [
+        {
+          url: "termix://deep-connect?connect=Web%20Server%201",
+          source: "os-scheme",
+        },
+      ],
+    });
+    defaultTab.mockReturnValue("terminal" as never);
+    vi.useFakeTimers();
+    startTermixLinkConsumer(double.app, linkSettings());
+    await vi.advanceTimersByTimeAsync(300);
+    expect(double.confirm).toHaveBeenCalledTimes(1);
+    expect(double.connectHost).toHaveBeenCalledWith(hosts[0], "terminal");
+  });
+
+  it("parses the path form and a registered protocol type", async () => {
+    const double = makeApp({
+      queuedLinks: [
+        { url: "termix://connect/10.0.0.5?type=vnc", source: "os-scheme" },
+      ],
+    });
+    vi.useFakeTimers();
+    startTermixLinkConsumer(double.app, linkSettings());
+    await vi.advanceTimersByTimeAsync(300);
+    expect(double.confirm).toHaveBeenCalledTimes(1);
+    expect(double.connectHost.mock.calls[0][1]).toBe("vnc");
+    const host = double.connectHost.mock.calls[0][0] as Record<string, unknown>;
+    expect(host.connectionType).toBe("vnc");
+  });
+
+  it("confirms command-line links too — every source confirms first", async () => {
+    const double = makeApp({
+      queuedLinks: [
+        { url: "termix://connect/10.0.0.5?type=vnc", source: "command-line" },
+      ],
+    });
+    vi.useFakeTimers();
+    startTermixLinkConsumer(double.app, linkSettings());
+    await vi.advanceTimersByTimeAsync(300);
+    expect(double.confirm).toHaveBeenCalledTimes(1);
+    expect(double.connectHost).toHaveBeenCalledTimes(1);
+  });
+
+  it("ignores core's termix://host/<id> links entirely", async () => {
+    const double = makeApp({
+      queuedLinks: [
+        { url: "termix://host/12", source: "os-scheme" },
+        { url: "termix://host/12?connect=web-01", source: "os-scheme" },
+      ],
+    });
+    vi.useFakeTimers();
+    startTermixLinkConsumer(double.app, linkSettings());
+    await vi.advanceTimersByTimeAsync(300);
+    expect(double.confirm).not.toHaveBeenCalled();
+    expect(double.connectHost).not.toHaveBeenCalled();
+  });
+
+  it("runs replayed links one at a time in arrival order", async () => {
+    const double = makeApp({
+      queuedLinks: [
+        { url: "termix://connect/Web%20Server%201", source: "os-scheme" },
+        { url: "termix://connect/10.0.0.5?type=vnc", source: "os-scheme" },
+        { url: "termix://connect/bogus%%target?type=vnc", source: "os-scheme" },
+      ],
+    });
+    // The saved-host link connects through the polled default connection.
+    defaultTab.mockReturnValueOnce("terminal" as never);
+    vi.useFakeTimers();
+    startTermixLinkConsumer(double.app, linkSettings());
+    await vi.advanceTimersByTimeAsync(500);
+    expect(double.confirm).toHaveBeenCalledTimes(2);
+    expect(double.confirm.mock.calls[0][0].title).toContain("Web Server 1");
+    expect(double.confirm.mock.calls[1][0].title).not.toContain("Web Server 1");
+    expect(double.connectHost).toHaveBeenCalledTimes(2);
+    // Strict arrival order: each link completed before the next started.
+    expect(double.confirm.mock.invocationCallOrder[0]).toBeLessThan(
+      double.confirm.mock.invocationCallOrder[1],
+    );
+  });
+
+  it("carries the credential id and view-only flag through a termix link", async () => {
+    const double = makeApp({
+      queuedLinks: [
+        {
+          url: "termix://connect/10.0.0.5?type=vnc&credential=deploy%20key&viewonly=1",
+          source: "os-scheme",
+        },
+      ],
+    });
+    vi.useFakeTimers();
+    startTermixLinkConsumer(double.app, linkSettings());
+    await vi.advanceTimersByTimeAsync(300);
+    expect(double.confirm).toHaveBeenCalledTimes(1);
+    const host = double.connectHost.mock.calls[0][0] as Record<string, unknown>;
+    expect(host.quickConnectLogin).toMatchObject({
+      protocol: "vnc",
+      credentialId: 7,
+      viewOnly: true,
+    });
+  });
+
+  it("surfaces refusals as toasts without confirming anything", async () => {
+    const double = makeApp({
+      queuedLinks: [{ url: "termix://connect/ghost", source: "os-scheme" }],
+    });
+    vi.useFakeTimers();
+    startTermixLinkConsumer(double.app, linkSettings());
+    await vi.advanceTimersByTimeAsync(300);
+    expect(toastError).toHaveBeenCalledWith(
+      double.t("deepLink.hostNotFound", { host: "ghost" }),
+    );
+    expect(double.confirm).not.toHaveBeenCalled();
   });
 });

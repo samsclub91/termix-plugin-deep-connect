@@ -1,4 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { readFileSync, readdirSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import path from "node:path";
 import type {
   PluginHostRecord,
   PluginCredentialSummary,
@@ -80,6 +83,7 @@ describe("resolveConnectPlan", () => {
       port: 2222,
       authType: "none",
     });
+    expect(result.host).not.toHaveProperty("quickConnectLogin");
   });
 
   it("uses the protocol's default port unless the link overrides it", () => {
@@ -107,23 +111,36 @@ describe("resolveConnectPlan", () => {
       credentialId: 8,
       port: 5900,
     });
-    // The credential CAN ride once the record exists, so nothing is marked
-    // not-carried — and the ad-hoc record stays as the fallback if the user
-    // declines the create.
+    // The credential rides by id on the quick connect too, so nothing is
+    // marked not-carried — and the ad-hoc record stays as the fallback if
+    // the user declines the create.
     expect(result.dialog?.credentialNotCarried).toBeUndefined();
+    expect(result.dialog?.credentialRides).toBe(true);
     expect(result.host).toMatchObject({ connectionType: "vnc", port: 5900 });
   });
 
   it("offers adoption for plain ad-hoc SSH with a credential", () => {
-    const result = plan("?connect=192.168.103.227&type=ssh&credential=deploy%20key");
+    const result = plan(
+      "?connect=192.168.103.227&type=ssh&credential=deploy%20key",
+    );
     expect(result.dialog?.adopt).toMatchObject({
       hostName: "192.168.103.227",
       type: "ssh",
       credentialId: 7,
       port: 22,
     });
-    const result2 = plan("?connect=192.168.103.227&credential=deploy%20key&using=adhoc");
+    const result2 = plan(
+      "?connect=192.168.103.227&credential=deploy%20key&using=adhoc",
+    );
     expect(result2.dialog?.adopt).toMatchObject({ type: "ssh", port: 22 });
+    // SSH keeps the v1.2 carry shape: username rides, no id login, and the
+    // credential does not "ride by id" on the quick connect.
+    expect(result2.host).toMatchObject({
+      authType: "none",
+      username: "deploy",
+    });
+    expect(result2.host).not.toHaveProperty("quickConnectLogin");
+    expect(result2.dialog?.credentialRides).toBeUndefined();
     // A no-type link that matches nothing stays a refusal — adoption is for
     // links the plugin can actually act on.
     expect(
@@ -191,10 +208,74 @@ describe("resolveConnectPlan", () => {
     );
   });
 
-  it("carries viewonly=1 into the dialog payload without acting on it", () => {
+  it("carries a verified credential by id on ad-hoc RDP/VNC quick connects", () => {
+    const result = plan("?connect=10.0.0.9&type=vnc&credential=vnc");
+    const login = (result.host as Record<string, unknown>)
+      .quickConnectLogin as Record<string, unknown>;
+    expect(login).toMatchObject({ protocol: "vnc", credentialId: 8 });
+    expect("username" in login).toBe(false);
+    expect("password" in login).toBe(false);
+    expect((result.host as Record<string, unknown>).connectionType).toBe("vnc");
+    const rdp = plan(
+      "?connect=10.0.0.5&type=rdp&credential=deploy%20key&domain=WAG",
+    );
+    const rdpLogin = (rdp.host as Record<string, unknown>)
+      .quickConnectLogin as Record<string, unknown>;
+    expect(rdpLogin).toMatchObject({ protocol: "rdp", credentialId: 7 });
+    expect("username" in rdpLogin).toBe(false);
+    expect("password" in rdpLogin).toBe(false);
+  });
+
+  it("refuses an ad-hoc link naming a credential it cannot verify", () => {
+    // Same refusal as the saved-host path and v1.2: a link must not open a
+    // session that silently ignores the login it claims to use.
+    expect(plan("?connect=10.0.0.5&type=ssh&credential=ghost").status).toBe(
+      "credentialNotFound",
+    );
+    expect(plan("?connect=10.0.0.5&type=vnc&credential=ghost").status).toBe(
+      "credentialNotFound",
+    );
+    expect(
+      plan("?connect=10.0.0.5&type=rdp&using=adhoc&credential=ghost").status,
+    ).toBe("credentialNotFound");
+  });
+
+  it("carries viewonly=1 onto the quick connect login for plugin protocols", () => {
     const result = plan("?connect=10.0.0.5&type=vnc&viewonly=1");
+    const login = (result.host as Record<string, unknown>)
+      .quickConnectLogin as Record<string, unknown>;
+    expect(login.viewOnly).toBe(true);
     expect(result.dialog?.viewOnly).toBe(true);
+    expect(result.dialog?.viewOnlyApplied).toBe(true);
     expect(result.host).toMatchObject({ connectionType: "vnc" });
+  });
+
+  it("applies viewonly=1 together with the credential id on the same login", () => {
+    const result = plan("?connect=10.0.0.9&type=vnc&credential=vnc&viewonly=1");
+    const login = (result.host as Record<string, unknown>)
+      .quickConnectLogin as Record<string, unknown>;
+    expect(login).toMatchObject({ credentialId: 8, viewOnly: true });
+  });
+
+  it("keeps viewonly=1 a note on saved-host and SSH paths", () => {
+    const ssh = plan("?connect=10.0.0.5&type=ssh&viewonly=1");
+    expect(ssh.dialog?.viewOnly).toBe(true);
+    expect(ssh.dialog?.viewOnlyApplied).toBeUndefined();
+    expect(ssh.host).not.toHaveProperty("quickConnectLogin");
+    const saved = plan("?connect=web%20server%201&viewonly=1&type=vnc");
+    expect(saved.status).toBe("saved");
+    expect(saved.dialog?.viewOnly).toBe(true);
+    expect(saved.dialog?.viewOnlyApplied).toBeUndefined();
+  });
+
+  it("never writes viewOnly=false into a built record", () => {
+    // A non-1 value parses to undefined and the built login carries NO
+    // viewOnly key at all — false is not a value any plan produces
+    // (restrict-only: links may turn input off, never on).
+    const plain = plan("?connect=10.0.0.5&type=vnc&viewonly=0");
+    const login = (plain.host as Record<string, unknown>).quickConnectLogin as
+      Record<string, unknown> | undefined;
+    expect(login?.viewOnly ?? undefined).toBeUndefined();
   });
 });
 
@@ -217,7 +298,60 @@ describe("resolveConnectPlan builder isolation", () => {
     );
   });
 
+  it("hands a verified credential to the builder WITHOUT username or password", () => {
+    const spy = vi.fn((input: Record<string, unknown>) => ({ ...input }));
+    resolveConnectPlan({
+      intent: parseDeepLinkConnect(
+        "?connect=10.0.0.5&type=rdp&credential=deploy%20key&domain=WAG",
+      )!,
+      hosts,
+      credentials,
+      protocols,
+      buildQuickConnect: spy as never,
+    });
+    const buildArgs = spy.mock.calls[0][0] as Record<string, unknown>;
+    expect(buildArgs).toMatchObject({
+      ip: "10.0.0.5",
+      port: 3389,
+      domain: "WAG",
+    });
+    // Values ride only as the id stamped onto the built login.
+    expect("username" in buildArgs).toBe(false);
+    expect("authType" in buildArgs).toBe(false);
+    expect("password" in buildArgs).toBe(false);
+    expect("credentialId" in buildArgs).toBe(false);
+  });
+
   beforeEach(() => {
     vi.clearAllMocks();
+  });
+});
+
+describe("viewOnly restrict-only invariant (source scan)", () => {
+  // Belt and braces on top of the behavioral tests: no source file may build
+  // a viewOnly value of false from link input. The parser only ever emits
+  // true or undefined, and every stamp site writes the literal `true`.
+  const srcDir = path.resolve(
+    path.dirname(fileURLToPath(import.meta.url)),
+    "../../src",
+  );
+
+  function* sourceFiles(dir: string): Generator<string> {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) yield* sourceFiles(full);
+      else if (/\.tsx?$/.test(entry.name)) yield full;
+    }
+  }
+
+  it("no code path builds viewOnly=false", () => {
+    const offenders: string[] = [];
+    for (const file of sourceFiles(srcDir)) {
+      const text = readFileSync(file, "utf8");
+      if (/viewOnly\s*(?::|=)\s*false/.test(text)) {
+        offenders.push(file);
+      }
+    }
+    expect(offenders).toEqual([]);
   });
 });

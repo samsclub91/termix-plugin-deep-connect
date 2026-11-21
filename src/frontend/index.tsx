@@ -3,7 +3,7 @@ import {
   type TabProps,
   type TermixApp,
 } from "@termix-ssh/plugin-sdk/frontend";
-import { startDeepLinkConsumer } from "./consumer";
+import { startDeepLinkConsumer, startTermixLinkConsumer } from "./consumer";
 import { StandaloneHandoff } from "./StandaloneHandoff";
 
 const TAB_ID = "deep-connect";
@@ -55,4 +55,7 @@ export function activate(app: TermixApp): void {
     standalone: StandaloneHandoff,
   });
   startDeepLinkConsumer(app);
+  // Desktop termix:// links (26.11.3): same grammar, same confirm. No-op
+  // where the shell does not expose the seam (web browsers).
+  startTermixLinkConsumer(app);
 }

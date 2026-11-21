@@ -93,10 +93,23 @@ export interface ConnectPlanDialog {
   adopt?: AdoptRequest;
   /** Set when a asked-for credential could not ride the session (ad-hoc). */
   credentialNotCarried?: { name: string; protocol?: string };
+  /**
+   * The link's verified credential rides the quick connect by id
+   * (quickConnectLogin.credentialId, resolved server-side by the protocol
+   * plugin): nothing is prompted for, there is no not-carried story, and an
+   * adoption fallback still carries it.
+   */
+  credentialRides?: boolean;
   /** The session rides the host's saved protocol login, not the link's. */
   protocolSaved?: boolean;
-  /** The link asked for observe-only (viewonly=1). Parsed, not applied. */
+  /** The link asked for observe-only (viewonly=1). Parsed, only ever true. */
   viewOnly?: boolean;
+  /**
+   * Set when the view-only request is APPLIED on the session (an ad-hoc
+   * plugin-protocol quick connect opens with its input off). Absent on saved
+   * hosts and SSH links, where the request stays a note on this path.
+   */
+  viewOnlyApplied?: boolean;
 }
 
 export interface ConnectPlan {
@@ -118,18 +131,26 @@ export interface ConnectPlan {
  * - Saved hosts keep their own log-in. A `credential=` name is verified
  *   against the user's credential list and surfaced in the confirm text, but
  *   the host record is never rewritten.
- * - Ad-hoc links WITH a credential and an adoptable type are adoption
- *   candidates: the plan says so (`adopt`), and the consumer offers to
- *   create the host in the "Ad-Hoc Hosts" folder so the credential rides
- *   server-side. The quick-connect record is still built and kept in the
- *   plan — it is the fallback when the confirm is declined or the route is
- *   unavailable (older core), exactly the v1 behavior.
- * - Ad-hoc SSH carries a resolved credential's username; the password/key
- *   cannot ride (plugins get redacted summaries, and an id-less quick-connect
- *   host cannot expand a stored credential server-side), so the session
- *   prompts. A plugin therefore never asks Termix for a secret.
- * - Ad-hoc RDP/VNC carries username and an AD domain; remote-desktop shows
- *   its own prompt for the password.
+ * - Ad-hoc RDP/VNC links WITH a verified credential carry it by id
+ *   (quickConnectLogin.credentialId): the remote-desktop plugin resolves the
+ *   saved credential on the server, where its secret never leaves Termix.
+ *   No username or password is put on the quick connect; the RDP domain
+ *   keeps riding in the login's fields. Adoption is still offered on top —
+ *   the saved host makes the link keep working from then on.
+ * - Ad-hoc SSH keeps the v1.2 behavior exactly (protocol plugins do not
+ *   cover ssh, so there is no seam to resolve through): a verified
+ *   credential rides as its username on an authType "none" record — the
+ *   password/key cannot ride and the session prompts — and adoption remains
+ *   the way the credential actually rides server-side.
+ * - An ad-hoc link naming an unknown credential is refused outright
+ *   (credentialNotFound) — same as v1.2. A link must not silently open a
+ *   session that ignores the login it claims.
+ * - Ad-hoc RDP/VNC links WITHOUT a credential (or with verification
+ *   unavailable) still build the v1-shaped username/password prompt record,
+ *   and remote-desktop shows its own prompt for the password.
+ * - viewonly=1 applies on ad-hoc plugin-protocol quick connects:
+ *   quickConnectLogin.viewOnly is set to true and nothing else — restrict
+ *   only, it can only ever turn input off.
  * - `connectionType` is set explicitly on ad-hoc hosts: remote-desktop reads
  *   its auth payload only when it matches the quick-connect login's protocol.
  */
@@ -188,6 +209,10 @@ export function resolveConnectPlan(options: {
 
   const address = intent.hostName;
   const username = credential?.username ?? "";
+  // The verified credential rides by id on plugin-protocol quick connects
+  // (the protocol plugin resolves it server-side); SSH always keeps the v1.2
+  // username-carry shape because ssh has no resolving protocol plugin.
+  const credentialById = !!credential && !coreSsh;
   let host: QuickConnectRecord;
   if (coreSsh) {
     // Ad-hoc SSH: carry the username, never a secret. authType "none" makes
@@ -201,10 +226,20 @@ export function resolveConnectPlan(options: {
       username,
       authType: "none",
     });
+  } else if (credentialById) {
+    // Ad-hoc RDP/VNC with a verified credential: the quick connect carries
+    // the credential by id and nothing secret-shaped — no username, no
+    // password. The server resolves the login (ctx.credentials.resolveLogin)
+    // and the RDP domain keeps riding in the login's fields.
+    host = buildQuickConnect({
+      protocol: protocol as DeepLinkProtocol,
+      ip: address,
+      port: intent.port ?? (protocol as DeepLinkProtocol).defaultPort,
+      ...(intent.domain ? { domain: intent.domain } : {}),
+    });
   } else {
-    // Ad-hoc RDP/VNC: username and domain ride; the password prompt comes
-    // from remote-desktop itself (quickConnectLogin has no credentialId
-    // support and plugins get no secret values).
+    // Ad-hoc RDP/VNC without a credential: username and domain ride; the
+    // password prompt comes from remote-desktop itself.
     host = buildQuickConnect({
       protocol: protocol as DeepLinkProtocol,
       ip: address,
@@ -214,6 +249,28 @@ export function resolveConnectPlan(options: {
       password: "",
       domain: intent.domain,
     });
+  }
+  // Stamp what core's builder alone cannot produce, keyed off the link:
+  //   quickConnectLogin.credentialId (verified credential, plugin protocols),
+  //   quickConnectLogin.viewOnly = true (viewonly=1 — restrict-only: it is
+  //   only ever added, and only ever true; no path ever writes false),
+  // then connectionType, which the protocol-plugin gate requires
+  // (quickConnectLogin.protocol === connectionType).
+  if (!coreSsh && (credentialById || intent.viewOnly)) {
+    const record = host as Record<string, unknown>;
+    const login: Record<string, unknown> = {
+      ...((record.quickConnectLogin as Record<string, unknown> | undefined) ??
+        {}),
+      protocol: protocol!.id,
+    };
+    if (credentialById && credential) {
+      login.credentialId = credential.id;
+      // "Omit username/password": the record carries the id, not values.
+      delete login.username;
+      delete login.password;
+    }
+    if (intent.viewOnly) login.viewOnly = true;
+    host = { ...record, quickConnectLogin: login } as QuickConnectRecord;
   }
   // createQuickConnectHost leaves connectionType unset; without it the
   // plugin-side gate `quickConnectLogin.protocol === connectionType` drops
@@ -227,7 +284,8 @@ export function resolveConnectPlan(options: {
   if (credential && ADOPTABLE_TYPES.has(typeForAdopt)) {
     // Adoption candidate: the consumer offers to create the saved host so
     // the credential rides server-side; the built quick connect is the
-    // fallback when the create is declined or unavailable.
+    // fallback when the confirm is declined or the route is unavailable —
+    // and on plugin protocols it now also carries the credential by id.
     return {
       status: "adhoc",
       host,
@@ -237,15 +295,18 @@ export function resolveConnectPlan(options: {
         hostLabel: username ? `${username}@${address}` : address,
         address,
         credential,
+        ...(credentialById ? { credentialRides: true } : {}),
         adopt: {
           hostName: address,
           type: typeForAdopt,
           credentialId: credential.id,
-          port: intent.port ??
+          port:
+            intent.port ??
             (coreSsh ? 22 : (protocol as DeepLinkProtocol).defaultPort),
           ...(intent.domain ? { domain: intent.domain } : {}),
         },
         viewOnly: intent.viewOnly,
+        viewOnlyApplied: intent.viewOnly && !coreSsh ? true : undefined,
       },
     };
   }
@@ -259,13 +320,16 @@ export function resolveConnectPlan(options: {
       hostLabel: username ? `${username}@${address}` : address,
       address,
       credential,
-      credentialNotCarried: credential
-        ? {
-            name: credential.name,
-            protocol: protocol ? protocol.id : "ssh",
-          }
-        : undefined,
+      ...(credentialById ? { credentialRides: true } : {}),
+      credentialNotCarried:
+        credential && !credentialById
+          ? {
+              name: credential.name,
+              protocol: protocol ? protocol.id : "ssh",
+            }
+          : undefined,
       viewOnly: intent.viewOnly,
+      viewOnlyApplied: intent.viewOnly && !coreSsh ? true : undefined,
     },
   };
 }
