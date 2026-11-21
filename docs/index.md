@@ -7,6 +7,10 @@ Deep Connect opens Termix sessions from Lansweeper asset action links: saved hos
 
 ## Use it
 
-Click a Lansweeper asset action (or paste a `?connect=` link into your browser). Termix asks you to confirm; accepting opens the session in a new tab and clears the link parameters from the URL. Using the link flow needs the Connect permission, which admins and users get by default.
+Click a Lansweeper asset action (or paste a `?view=deep-connect&connect=…` link into your
+browser). The plugin's own view opens and asks you to confirm; accepting opens the session
+right there (rarely, Termix hands off to one new tab that finishes the connect — no second
+confirm), and cancelling closes the card without opening anything. Using the link flow
+needs the Connect permission, which admins and users get by default.
 
 Full link recipes for Lansweeper administrators are in [the setup guide](lansweeper-setup.md).

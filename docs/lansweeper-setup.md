@@ -59,18 +59,21 @@ characters.
 
 ## Caveats
 
-- The link carries **names only, never secrets**. The confirm dialog always shows first;
-  cancelling clears the link from the URL.
+- The link carries **names only, never secrets**. The confirm card in the plugin's own view
+  always shows first; cancelling opens nothing.
 - **Saved hosts** connect with their own stored log-ins — a `credential=` name is verified
   and shown in the confirm text, but does not replace the host's login.
 - **Ad-hoc links** carry names, never secrets. An RDP/VNC link with a matching `credential=` name
   connects by credential id (resolved server-side by the protocol plugin — the secret never
   reaches the browser); without any `credential=` it stops at remote-desktop's own prompt; an
   unmatched credential name is refused rather than prompting or downgrading. An SSH link adopts a
-  saved host or stops at Termix's own SSH prompt. The confirm dialog always states what will be
+  saved host or stops at Termix's own SSH prompt. The confirm text always states what will be
   used.
-- Signed-out browsers get the Termix login first and return to the link; unknown
-  parameters and `view=` are dropped on the way by the hand-off page.
+- Keep asset actions on the `?view=deep-connect&…` form: a bare `/?connect=…` URL is only
+  routed by the desktop app, not by the web UI.
+- Signed-out browsers get the Termix login first and return to the link.
+- If Termix's in-view connect cannot run, the view may open one new browser tab to finish
+  the same link (no second confirm); a failure there ends in a plain error card.
 - Termix needs engine 26.11.3 or newer and the plugin enabled for your role
   (admins and users by default).
 - Verify the template-token syntax against your own Lansweeper version before rollout —
