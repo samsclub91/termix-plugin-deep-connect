@@ -53,13 +53,17 @@ https://<termix>/?view=deep-connect&connect=<name|address>&type=<ssh|rdp|vnc>&cr
 
 The `?view=deep-connect` page IS the web entry: core opens the plugin's own full-screen
 view there, which renders its own confirm card from the link (target, connection type,
-credential by name, view-only). Clicking **Connect** opens the session from inside that
-view — saved hosts straight away, credentialed ad-hoc links by saving the record on your
-confirm and connecting to it. When Termix's app surface cannot act from the view, one new
-browser tab may open to finish the connect (it auto-connects there, no second confirm);
-failures dead-end with a clear error card instead of re-opening windows. A bare
-`/?connect=…` URL is **desktop-only**: Termix 26.11.3 routes it in the desktop app's
-`termix://` handling but never on the web, so keep links on the `?view=` form.
+credential by name, view-only). Clicking **Connect** finishes honestly in Termix itself:
+a saved host — or a credentialed ad-hoc link whose record the view saved on your confirm
+(the save is verified by the backend response) — opens **Termix in one new tab** with the
+record ready, and you start the session from the Hosts list there. The card says plainly
+that the page cannot open sessions itself (Termix requires its shell) and keeps an
+**Open Termix** button as the manual path; the page never claims a session opened on the
+web. Links that cannot finish there — an ad-hoc address without a `credential=` to
+attach, a type the save route cannot create, an unknown host or credential name, or a
+failed save — say so and open nothing. A bare `/?connect=…` URL is **desktop-only**:
+Termix 26.11.3 routes it in the desktop app's `termix://` handling but never on the web,
+so keep links on the `?view=` form.
 
 ## Desktop `termix://` links
 
@@ -89,9 +93,11 @@ For example: `termix://connect/Web%20Server%201?type=vnc&viewonly=1` or
 - `src/frontend/connect-plan.ts` — the pure plan: pick the saved host, verify the
   credential name, build the quick-connect record, decide which tab type passes through.
 - `src/frontend/consumer.ts` — the activate-time consumer: waits for the shell and both
-  registries, asks once, connects, or explains with a toast.
+  registries, asks once, connects, or explains with a toast. Also holds the standalone
+  page's landing resolver (`resolveStandaloneLanding`).
 - `src/frontend/StandaloneHandoff.tsx` — the standalone `?view=` page: the web consumer
-  (confirm-first card from `props.params`, in-view connect, one-shot go=1 fallback).
+  (confirm-first card from `props.params`; resolves the link, saves only the consented
+  adoption with its response verified, opens one app-root tab, never claims a session).
 - `src/frontend/index.tsx` — activation: the tab registration and the consumer.
 
 ## Honest limitations (v2.0)
@@ -124,12 +130,13 @@ For example: `termix://connect/Web%20Server%201?type=vnc&viewonly=1` or
   dialog always names the credential, so never accept a link that names a log-in you do not
   expect.
 - A link with no saved match and no type is refused; an ad-hoc link whose type no registered
-  plugin provides is refused with a toast (and the `?view=` page refuses it on the confirm
-  click, when the registry has settled).
-- In the web `?view=` flow an ad-hoc link **without a matched `credential=`** cannot open:
-  Termix's plugin frames open sessions by saved host id only. The view says so plainly and
-  opens nothing. The same link works from the desktop app (`termix://…`), where Termix's own
-  quick-connect prompt path runs in the shell.
+  plugin provides is refused with a toast in the app (and the `?view=` page refuses it after
+  the confirm click, once the protocol registry has settled).
+- In the web `?view=` flow an ad-hoc link **without a matched `credential=`** cannot open or
+  save: Termix's plugin frames open sessions by saved host id only, and there is nothing to
+  attach. The view refuses it in place — no save, no tab — and points at the manual
+  **Open Termix** button. The same link works from the desktop app (`termix://…`), where
+  Termix's own quick-connect prompt path runs in the shell.
 - Created hosts carry a generic `ad-hoc` tag and a dated note, in the `Ad-Hoc Hosts` folder. The
   plugin never deletes records; clear the folder yourself whenever you want.
 
