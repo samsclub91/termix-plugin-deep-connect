@@ -2,7 +2,9 @@ import { describe, expect, it } from "vitest";
 import type { PluginHostRecord } from "@termix-ssh/plugin-sdk/frontend";
 import {
   findConnectableHost,
+  isCoreHostLink,
   parseDeepLinkConnect,
+  parseTermixLinkUrl,
   stripDeepLinkParams,
 } from "../../src/frontend/deep-link";
 
@@ -103,6 +105,31 @@ describe("parseDeepLinkConnect", () => {
     ).toBeUndefined();
     expect(parseDeepLinkConnect("?connect=web-01")?.viewOnly).toBeUndefined();
   });
+
+  it("never builds viewOnly=false: the restrict-only invariant", () => {
+    // The parameter is only ever accepted as the exact value "1" (no trim,
+    // no coercion), and the parsed intent can only carry viewOnly: true or
+    // undefined.
+    for (const value of [
+      "0",
+      "true",
+      "false",
+      "yes",
+      "on",
+      "1 ",
+      "",
+      "11",
+      "1,",
+      "01",
+    ]) {
+      const intent = parseDeepLinkConnect(
+        `?connect=web-01&viewonly=${encodeURIComponent(value)}`,
+      );
+      expect(intent?.viewOnly === false).toBe(false);
+      if (value === "1") expect(intent?.viewOnly).toBe(true);
+      else expect(intent?.viewOnly).toBeUndefined();
+    }
+  });
 });
 
 describe("stripDeepLinkParams", () => {
@@ -160,5 +187,121 @@ describe("findConnectableHost", () => {
     ).toBeUndefined();
     expect(findConnectableHost([], { hostName: "web-01" })).toBeUndefined();
     expect(findConnectableHost([], { hostName: "" })).toBeUndefined();
+  });
+});
+
+describe("isCoreHostLink", () => {
+  it("claims core's termix://host/<id> form", () => {
+    expect(isCoreHostLink("termix://host/12")).toBe(true);
+    expect(isCoreHostLink("termix://host/12?anything=1")).toBe(true);
+    // Case-sensitive, exactly like core's own hostIdOf: a form core would
+    // not act on is not core's form.
+    expect(isCoreHostLink("termix://HOST/12")).toBe(false);
+  });
+
+  it("leaves everything else to the plugin", () => {
+    expect(isCoreHostLink("termix://connect/web-01?type=vnc")).toBe(false);
+    expect(isCoreHostLink("termix://deep-connect?connect=web-01")).toBe(false);
+    // The host/ namespace is core's even when the segment is not an id.
+    expect(isCoreHostLink("termix://host/web-01")).toBe(true);
+    expect(isCoreHostLink("termix://host/")).toBe(true);
+    expect(isCoreHostLink("https://termix.example.com/?connect=web-01")).toBe(
+      false,
+    );
+    expect(isCoreHostLink("not a url")).toBe(false);
+  });
+});
+
+describe("parseTermixLinkUrl", () => {
+  it("parses the query form with the same grammar", () => {
+    expect(
+      parseTermixLinkUrl("termix://deep-connect?connect=web-01&type=vnc"),
+    ).toEqual({
+      hostName: "web-01",
+      type: "vnc",
+      credentialName: undefined,
+      port: undefined,
+      using: undefined,
+      domain: undefined,
+      viewOnly: undefined,
+    });
+  });
+
+  it("parses full grammar parameters on the termix:// scheme", () => {
+    expect(
+      parseTermixLinkUrl(
+        "termix://connect/10.0.0.5?type=rdp&credential=adm&port=3390&domain=WAG&using=adhoc&viewonly=1",
+      ),
+    ).toEqual({
+      hostName: "10.0.0.5",
+      type: "rdp",
+      credentialName: "adm",
+      port: 3390,
+      using: "adhoc",
+      domain: "WAG",
+      viewOnly: true,
+    });
+  });
+
+  it("takes a path target under connect/", () => {
+    expect(parseTermixLinkUrl("termix://connect/web-01")?.hostName).toBe(
+      "web-01",
+    );
+    expect(
+      parseTermixLinkUrl("termix://connect/Web%20Server%201?type=ssh")
+        ?.hostName,
+    ).toBe("Web Server 1");
+    expect(
+      parseTermixLinkUrl("termix://connect/Web%20Server%201?type=ssh")?.type,
+    ).toBe("ssh");
+  });
+
+  it("decodes a percent-encoded path target and trims it", () => {
+    expect(parseTermixLinkUrl("termix://connect/%20web-01%20")?.hostName).toBe(
+      "web-01",
+    );
+  });
+
+  it("ignores extra path segments after the target", () => {
+    // Asset managers append labels; only the first segment is the target.
+    expect(parseTermixLinkUrl("termix://connect/web-01/launch")?.hostName).toBe(
+      "web-01",
+    );
+  });
+
+  it("prefers an explicit connect= in the query over a path target", () => {
+    const intent = parseTermixLinkUrl("termix://connect/web-01?connect=other");
+    expect(intent?.hostName).toBe("other");
+  });
+
+  it("ignores core's termix://host/<id> form", () => {
+    expect(parseTermixLinkUrl("termix://host/12")).toBeNull();
+    expect(parseTermixLinkUrl("termix://host/12?connect=web-01")).toBeNull();
+    expect(parseTermixLinkUrl("termix://host/web-01")).toBeNull();
+  });
+
+  it("returns null for non-termix or unusable URLs", () => {
+    expect(
+      parseTermixLinkUrl("https://example.com/?connect=web-01"),
+    ).toBeNull();
+    expect(parseTermixLinkUrl("termix:connect/web-01")).toBeNull();
+    expect(parseTermixLinkUrl("not a url")).toBeNull();
+    expect(parseTermixLinkUrl("")).toBeNull();
+  });
+
+  it("returns null when no target is present", () => {
+    expect(parseTermixLinkUrl("termix://connect")).toBeNull();
+    expect(parseTermixLinkUrl("termix://connect?type=vnc")).toBeNull();
+    expect(parseTermixLinkUrl("termix://deep-connect")).toBeNull();
+    expect(parseTermixLinkUrl("termix://connect/")).toBeNull();
+    expect(parseTermixLinkUrl("termix://connect/%20%20")).toBeNull();
+  });
+
+  it("never builds viewOnly=false from a termix link", () => {
+    const bad = parseTermixLinkUrl(
+      "termix://connect/web-01?type=vnc&viewonly=0",
+    );
+    expect(bad?.viewOnly).toBeUndefined();
+    expect(bad?.viewOnly === false).toBe(false);
   });
 });

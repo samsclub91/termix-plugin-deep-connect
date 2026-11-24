@@ -1,5 +1,26 @@
 # Changelog
 
+## 2.0.0
+
+### Changed
+
+- Ported to plugin API 2 (engine.api `"2"`, `@termix-ssh/plugin-sdk` 2.11.0); requires Termix 26.11.3. API-1 manifests stopped loading on Termix 26.11.2, hence the major bump; nothing about link behavior changed with it
+- Web links changed shape to match Termix 26.11.3: the supported entry is now `https://<termix>/?view=deep-connect&<grammar>`. A bare `/?connect=…` URL is not routed by the web UI anymore — it stays a desktop-app behavior, so asset actions should use the `?view=` form
+- The `?view=deep-connect` page now consumes the link itself, in place: it is core's own full-screen view (Termix runs API-2 plugins in sandboxed frames there) and renders the plugin's own confirm card (target, type, credential by name, view-only). Because a sandboxed frame has no shell session surface, the page finishes honestly: a saved host — or a credentialed ad-hoc link whose record you agreed to save (the save is verified by the backend response) — opens **Termix in one new tab** with the record ready, and you start the session from the Hosts list there; the card says plainly that the page itself cannot open sessions (Termix requires its shell), with an Open Termix button as the manual path. This keeps every web connect confirm-first while preserving the one-click Lansweeper flow; the earlier relaunch-to-app-root design could not survive core's framing (no top-level navigation from a plugin frame), so the in-view confirm was adopted instead
+- Nothing on the web page claims a session anymore: the machinery that handed the connect to a `go=1` tab that "auto-connected" is gone (a frame cannot open sessions — those bridge calls dead-end unobservably there), and so is the false "Session opened" success state. When a link cannot finish on the page — an ad-hoc address without a `credential=` to attach, a type the save route cannot create, a missing host or credential name, or a failed save — it says so plainly and opens nothing; its only control is the manual Open Termix button. A crafted `go=1` link is just an ordinary grammar link now: it shows the same confirm card
+- Ad-hoc RDP/VNC links name a credential (`credential=<name>`): the quick connect now carries it by id (`quickConnectLogin.credentialId`) and the remote-desktop plugin resolves it server-side — no username or password rides the link, and its secret never reaches the browser. Ad-hoc SSH keeps the 1.2 behavior exactly (a saved credential still cannot ride a quick SSH connect; its username does, and the session prompts). When the named credential does not exist, the link is refused (the same credentialNotFound refusal as in 1.2).
+- Adopting an ad-hoc RDP/VNC link falls back to a quick connect that also carries the credential by id, instead of the old "will be asked for in the session" path; the note about being prompted is gone there
+
+### Added
+
+- `viewonly=1` now applies: ad-hoc RDP/VNC quick connects open with the session's input off (`quickConnectLogin.viewOnly`). It stays restrict-only — the parameter is accepted exactly as `1` and can only turn input off, never on; every other value is ignored. Saved hosts and SSH links still read the note without acting on it
+- Desktop app `termix://` links (`app.deepLinks`, Termix 26.11.3) connect through the same grammar: `termix://connect/<target>?type=…` and `termix://…?connect=…&type=…&…` forms reach the same plan, the same confirm and the same connect path as browser `?connect=` links. Core's own `termix://host/<id>` form is left to Termix, and every `termix://` connect still confirms first — the OS scheme is reachable from anywhere, so nothing opens without your click
+- Repeated replays of the same desktop link are ignored per session: the desktop layer replays recently seen `termix://` links to every new listener registration (a plugin disable/enable cycle re-delivers them), so a link that already ran its confirm this session is dropped instead of re-confirmed — a port of core's own replay guard
+
+### Fixed
+
+- VNC and RDP ad-hoc links from the standalone `?view=` page work now: the web landing classified ad-hoc intents against the shell's protocol registry, which never populates on that page (the shell never mounts there), so every vnc/rdp link spent its whole settle budget waiting for it and then refused with "no plugin provides this type" before any save attempt — VNC console links were dead from the web. The landing no longer polls the unreachable registry and classifies the ADOPTION by the link's own `type=`: exactly ssh, vnc and rdp (the set the adopt route itself validates), so a credentialed ad-hoc vnc/rdp link is saved to Termix and lands there like an ssh link; a type the save route cannot create still refuses; credential-less links still cannot attach anything; the page still opens no session — connecting happens in Termix
+
 ## 1.2.0
 
 ### Changed

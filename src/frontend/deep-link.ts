@@ -31,13 +31,21 @@ export interface DeepLinkConnectIntent {
   /** Optional AD domain for RDP-style direct auth (ad-hoc connects). */
   domain?: string;
   /**
-   * Observe-only request for ad-hoc connects (viewonly=1). Restrict-only by
+   * Observe-only request (viewonly=1, exact value only). Restrict-only by
    * design: a link may add input filtering, never grant interactivity.
-   * Reserved — the connect path does not apply this yet; a host's own
-   * read-only setting still applies wherever Termix provides one.
+   * Applied on ad-hoc RDP/VNC quick connects (quickConnectLogin.viewOnly,
+   * resolved by the protocol plugin); a saved host or an SSH link still just
+   * reads the note.
    */
   viewOnly?: boolean;
 }
+
+/**
+ * The `?view=` value that opens the standalone page: core's
+ * `standaloneViewFor` matches a registered tab type by this id, so the
+ * `?view=` name and the registered tab id are the same string by design.
+ */
+export const STANDALONE_VIEW_ID = "deep-connect";
 
 /** Every query parameter the deep-link connector claims on a URL. */
 export const DEEP_LINK_PARAMS = [
@@ -88,8 +96,76 @@ export function parseDeepLinkConnect(
     port: port != null && !Number.isNaN(port) && port > 0 ? port : undefined,
     using,
     domain: params.get("domain")?.trim() || undefined,
-    viewOnly: params.get("viewonly")?.trim() === "1" ? true : undefined,
+    // Exact value "1" only: no trim, no coercion — any other spelling means
+    // the link is not asking for view-only (restrict-only param).
+    viewOnly: params.get("viewonly") === "1" ? true : undefined,
   };
+}
+
+/** Parses a URL, or returns null when the string is not a usable URL. */
+function parseUrl(url: string): URL | null {
+  try {
+    return new URL(url);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Termix's own link namespace: `termix://host/<id>` opens a saved host, and
+ * core handles it itself (it still asks first when the link came from
+ * outside). Nothing else in that namespace is core's; the plugin only ever
+ * parses links OUTSIDE it.
+ */
+export function isCoreHostLink(url: string): boolean {
+  const parsed = parseUrl(url);
+  if (!parsed || parsed.protocol !== "termix:") return false;
+  // Same segment walk as core's hostIdOf: authority + path segments.
+  const parts = `${parsed.host}${parsed.pathname}`.split("/").filter(Boolean);
+  return parts.length > 0 && parts[0] === "host";
+}
+
+/**
+ * Reads a {@link DeepLinkConnectIntent} from a desktop `termix://` link, so
+ * OS-scheme links and browser search strings share ONE grammar (see
+ * parseDeepLinkConnect). Accepted forms:
+ *
+ *   termix://connect/<target>?type=…&credential=…   (target in the path)
+ *   termix://<host>?connect=<target>&type=…         (target in the query)
+ *
+ * An explicit connect= in the query wins over a path target. Any termix://
+ * authority works for the query form (the plugin id is conventional, not
+ * required); a path target must sit under `connect`. Extra path segments
+ * after the target are ignored, so asset managers can append labels. Core's
+ * termix://host/<id> form is never parsed here — core owns it (and asks
+ * before it connects). Returns null for anything without a target.
+ */
+export function parseTermixLinkUrl(url: string): DeepLinkConnectIntent | null {
+  const parsed = parseUrl(url);
+  if (!parsed || parsed.protocol !== "termix:") return null;
+  // The documented desktop forms carry an authority (termix://connect/…,
+  // termix://<plugin>?…); an opaque termix: path form is not ours.
+  if (!parsed.host) return null;
+  if (isCoreHostLink(url)) return null;
+  const segments = `${parsed.host}${parsed.pathname}`
+    .split("/")
+    .filter(Boolean);
+  const params = new URLSearchParams(parsed.search);
+  if (
+    segments[0] === "connect" &&
+    segments.length > 1 &&
+    !params.has("connect")
+  ) {
+    let target = "";
+    try {
+      target = decodeURIComponent(segments[1] ?? "").trim();
+    } catch {
+      return null; // A malformed percent sequence is never a target.
+    }
+    if (!target) return null;
+    params.set("connect", target);
+  }
+  return parseDeepLinkConnect(`?${params}`);
 }
 
 /**

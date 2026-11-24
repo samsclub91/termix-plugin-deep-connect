@@ -26,6 +26,7 @@ const credentialState = vi.hoisted(() => ({
 
 vi.mock("@termix-ssh/plugin-sdk/frontend", () => ({
   listCredentials: vi.fn(async () => credentialState.credentials),
+  notifyHostsChanged: vi.fn(),
 }));
 
 // Deliberately NOT exporting usePluginApi from this mock: without an injected
@@ -33,17 +34,22 @@ vi.mock("@termix-ssh/plugin-sdk/frontend", () => ({
 // mocks exercise exactly that.
 import { toast } from "sonner";
 import * as ui from "@termix-ssh/plugin-sdk/ui";
-import type {
-  PluginApiClient,
-  PluginCredentialSummary,
-  PluginHostRecord,
-  TermixApp,
+import {
+  listCredentials as sdkListCredentials,
+  notifyHostsChanged as sdkNotify,
+  type PluginApiClient,
+  type PluginCredentialSummary,
+  type PluginHostRecord,
+  type TermixApp,
 } from "@termix-ssh/plugin-sdk/frontend";
 import {
   consumeDeepLink,
   resetDeepLinkConsumerForTests,
+  resolveStandaloneLanding,
   startDeepLinkConsumer,
+  startTermixLinkConsumer,
 } from "../../src/frontend/consumer";
+import { parseDeepLinkConnect } from "../../src/frontend/deep-link";
 
 const listProtocols = vi.mocked(ui.listHostProtocols);
 const defaultTab = vi.mocked(ui.getDefaultConnectionTab);
@@ -59,13 +65,21 @@ const credentials: PluginCredentialSummary[] = [
   { id: 7, name: "Deploy Key", username: "deploy", authType: "password" },
 ];
 
+interface TestLink {
+  url: string;
+  source: "os-scheme" | "command-line";
+}
+
 interface AppDouble {
   app: TermixApp;
   confirm: ReturnType<typeof vi.fn>;
   listHosts: ReturnType<typeof vi.fn>;
   connectHost: ReturnType<typeof vi.fn>;
   openTab: ReturnType<typeof vi.fn>;
+  onOpen: ReturnType<typeof vi.fn>;
   fireReady: () => void;
+  disposeAll: () => void;
+  deliverLink: (link: TestLink) => void;
   t: (key: string, opts?: Record<string, unknown>) => string;
 }
 
@@ -73,12 +87,38 @@ function makeApp(options?: {
   hosts?: PluginHostRecord[];
   credentials?: PluginCredentialSummary[];
   confirmResult?: boolean;
+  /** Queued termix:// links replayed to the listener on registration. */
+  queuedLinks?: TestLink[];
 }): AppDouble {
   const onReadyListeners: (() => void)[] = [];
+  const disposers: (() => void)[] = [];
   const t = (key: string, opts?: Record<string, unknown>) =>
     opts ? `${key}:${JSON.stringify(opts)}` : key;
   const confirm = vi.fn(async () => options?.confirmResult ?? true);
   const listHosts = vi.fn(async () => options?.hosts ?? hosts);
+  // A faithful stand-in for core's deep-links module: deliveries land in a
+  // recent list (≤20) that every NEW registration replays — the same link
+  // objects, exactly what a plugin disable/enable hands back — and the
+  // returned disposer removes only that listener from later deliveries.
+  const activeListeners = new Set<(link: TestLink) => void>();
+  const recentLinks: TestLink[] = [];
+  const onOpen = vi.fn((listener: (link: TestLink) => void): (() => void) => {
+    activeListeners.add(listener);
+    for (const link of recentLinks) {
+      listener(link);
+    }
+    return () => activeListeners.delete(listener);
+  });
+  const deliverLink = (link: TestLink): void => {
+    recentLinks.push(link);
+    if (recentLinks.length > 20) recentLinks.shift();
+    for (const listener of [...activeListeners]) {
+      listener(link);
+    }
+  };
+  for (const link of options?.queuedLinks ?? []) {
+    deliverLink(link);
+  }
   const app = {
     pluginId: "deep-connect",
     t,
@@ -96,6 +136,10 @@ function makeApp(options?: {
       connectHost: vi.fn(),
       openTab: vi.fn(),
     },
+    onDispose: (fn: () => void) => {
+      disposers.push(fn);
+    },
+    ...(options?.queuedLinks ? { deepLinks: { onOpen } } : {}),
   } as unknown as TermixApp;
   return {
     app,
@@ -104,7 +148,10 @@ function makeApp(options?: {
     connectHost: app.tabs.connectHost as never,
     openTab: (app.tabs as unknown as { openTab: ReturnType<typeof vi.fn> })
       .openTab,
+    onOpen,
     fireReady: () => onReadyListeners.forEach((listener) => listener()),
+    disposeAll: () => disposers.forEach((disposer) => disposer()),
+    deliverLink,
     t,
   };
 }
@@ -119,10 +166,16 @@ function adoptSettings(
   api: {
     post: ReturnType<typeof vi.fn>;
   } | null,
-): { settleBudgetMs: number; pollMs: number; defaultTabBudgetMs: number; adoptApi: () => PluginApiClient } {
+): {
+  settleBudgetMs: number;
+  pollMs: number;
+  defaultTabBudgetMs: number;
+  adoptApi: () => PluginApiClient;
+} {
   return {
     ...SETTINGS,
-    adoptApi: () => (api ? { post: api as unknown } : null) as unknown as PluginApiClient,
+    adoptApi: () =>
+      (api ? { post: api as unknown } : null) as unknown as PluginApiClient,
   };
 }
 
@@ -244,7 +297,58 @@ describe("consumeDeepLink", () => {
     expect(post).not.toHaveBeenCalled();
   });
 
-  it("adds the viewonly note without applying view-only", async () => {
+  it("carries an ad-hoc rdp/vnc credential by id on the quick connect", async () => {
+    // The route IS injected but refuses (adopt unavailable): the fallback
+    // quick connect now carries the credential by id, so there is no
+    // not-carried note and no prompt story.
+    post.mockRejectedValue(new Error("route gone"));
+    const double = makeApp();
+    defaultTab.mockReturnValue(null as never);
+    vi.useFakeTimers();
+    const task = consumeDeepLink(
+      double.app,
+      "?connect=10.0.0.5&type=vnc&credential=deploy%20key",
+      adoptSettings(credentialState.post as never),
+    );
+    await vi.advanceTimersByTimeAsync(400);
+    await task;
+    expect(toastError).toHaveBeenCalledWith("deepLink.adoptUnavailable");
+    expect(double.confirm).toHaveBeenCalledTimes(2);
+    const fallbackArgs = double.confirm.mock.calls[1][0];
+    expect(fallbackArgs.description).toContain("deepLink.credentialNote");
+    expect(fallbackArgs.description).not.toContain(
+      "deepLink.adhocCredentialNote",
+    );
+    expect(quickConnect).toHaveBeenCalledWith(
+      expect.objectContaining({ ip: "10.0.0.5", port: 5900 }),
+    );
+    const host = double.connectHost.mock.calls[0][0] as Record<string, unknown>;
+    const login = host.quickConnectLogin as Record<string, unknown>;
+    expect(login).toMatchObject({ protocol: "vnc", credentialId: 7 });
+    expect("username" in login).toBe(false);
+    expect("password" in login).toBe(false);
+  });
+
+  it("applies viewonly=1 on an ad-hoc plugin-protocol quick connect", async () => {
+    const double = makeApp();
+    vi.useFakeTimers();
+    const task = consumeDeepLink(
+      double.app,
+      "?connect=10.0.0.5&type=vnc&viewonly=1",
+      SETTINGS,
+    );
+    await vi.advanceTimersByTimeAsync(400);
+    await task;
+    const host = double.connectHost.mock.calls[0][0] as Record<string, unknown>;
+    const login = host.quickConnectLogin as Record<string, unknown>;
+    expect(login.viewOnly).toBe(true);
+    expect(login.protocol).toBe("vnc");
+    const description = double.confirm.mock.calls[0][0].description as string;
+    expect(description).toContain("deepLink.viewOnlyNote");
+    expect(description).not.toContain("deepLink.viewOnlySavedNote");
+  });
+
+  it("adds the viewonly note without applying view-only on ssh links", async () => {
     const double = makeApp();
     vi.useFakeTimers();
     const task = consumeDeepLink(
@@ -256,9 +360,13 @@ describe("consumeDeepLink", () => {
     await task;
     expect(
       (double.confirm.mock.calls[0][0].description as string).includes(
-        "deepLink.viewOnlyNote",
+        "deepLink.viewOnlySavedNote",
       ),
     ).toBe(true);
+    // SSH quick connects never carry a quickConnectLogin.
+    expect(quickConnect.mock.calls[0][0]).not.toHaveProperty(
+      "quickConnectLogin",
+    );
   });
 
   it("creates and reconnects through the saved flow when the user confirms adoption", async () => {
@@ -289,12 +397,14 @@ describe("consumeDeepLink", () => {
     // The confirm ran before the create: the adopt dialog, with its own keys.
     expect(double.confirm).toHaveBeenCalledTimes(1);
     const dialog = double.confirm.mock.calls[0][0];
-    expect(dialog.title).toBe(double.t("deepLink.adoptTitle", { host: "10.0.0.5" }));
+    expect(dialog.title).toBe(
+      double.t("deepLink.adoptTitle", { host: "10.0.0.5" }),
+    );
     expect(dialog.confirmLabel).toBe("deepLink.adoptAction");
     expect(dialog.description).toContain("deepLink.adoptDescription");
     // The real en.json text carries the folder name; the double's t() only
     // renders params, so assert the interpolation payload.
-    expect(dialog.description).toContain('"name":"Deploy Key"');
+    expect(dialog.description).toContain('\"name\":\"Deploy Key\"');
     expect(post).toHaveBeenCalledWith("/adopt", {
       hostName: "10.0.0.5",
       type: "ssh",
@@ -397,11 +507,9 @@ describe("consumeDeepLink", () => {
       // route resolves the link protocol's default server-side.
       sshOff: true,
     });
-    expect(double.openTab).toHaveBeenCalledWith(
-      pluginMade,
-      "vnc",
-      { label: "192.168.103.99" },
-    );
+    expect(double.openTab).toHaveBeenCalledWith(pluginMade, "vnc", {
+      label: "192.168.103.99",
+    });
     expect(double.connectHost).not.toHaveBeenCalled();
   });
 
@@ -434,11 +542,9 @@ describe("consumeDeepLink", () => {
       credentialId: 7,
     });
     expect(post.mock.calls[0][0]).not.toHaveProperty("sshOff");
-    expect(double.openTab).toHaveBeenCalledWith(
-      userHost,
-      "vnc",
-      { label: "wag-server01" },
-    );
+    expect(double.openTab).toHaveBeenCalledWith(userHost, "vnc", {
+      label: "wag-server01",
+    });
     expect(toastSuccess).toHaveBeenCalledWith(
       double.t("deepLink.adoptUpdated", { host: "wag-server01" }),
     );
@@ -472,11 +578,9 @@ describe("consumeDeepLink", () => {
       port: 33389,
       sshOff: true,
     });
-    expect(double.openTab).toHaveBeenCalledWith(
-      pluginMade,
-      "rdp",
-      { label: "wag-itvm15" },
-    );
+    expect(double.openTab).toHaveBeenCalledWith(pluginMade, "rdp", {
+      label: "wag-itvm15",
+    });
   });
 
   it("leaves a user-shaped record alone when it already has the protocol login", async () => {
@@ -689,5 +793,471 @@ describe("startDeepLinkConsumer", () => {
     await vi.advanceTimersByTimeAsync(100);
     expect(double.confirm).toHaveBeenCalledTimes(1);
     expect(double.connectHost).toHaveBeenCalledTimes(1);
+  });
+
+  it("no-ops when the page has no search string at all (in-frame)", () => {
+    const double = makeApp();
+    const scrub = vi.fn();
+    startDeepLinkConsumer(double.app, {
+      env: { locationSearch: () => "", scrub },
+    });
+    // A sandboxed frame's location carries no search and the shell forwards
+    // none: nothing consumes, nothing scrubs — the standalone ?view= page
+    // owns web consumption.
+    expect(scrub).not.toHaveBeenCalled();
+    expect(listProtocols).not.toHaveBeenCalled();
+    expect(toastError).not.toHaveBeenCalled();
+    expect(double.confirm).not.toHaveBeenCalled();
+  });
+});
+
+describe("resolveStandaloneLanding", () => {
+  it("lands a saved host: classify only, no dialog, no tab bridge", async () => {
+    const double = makeApp();
+    const landing = await resolveStandaloneLanding(
+      double.app,
+      parseDeepLinkConnect("?connect=Web%20Server%201")!,
+    );
+    expect(landing).toEqual({ kind: "saved", hostLabel: "Web Server 1" });
+    expect(double.connectHost).not.toHaveBeenCalled();
+    expect(double.openTab).not.toHaveBeenCalled();
+    expect(double.confirm).not.toHaveBeenCalled();
+    expect(toastError).not.toHaveBeenCalled();
+  });
+
+  it("keeps a saved-host landing regardless of the link's type", async () => {
+    const double = makeApp();
+    const landing = await resolveStandaloneLanding(
+      double.app,
+      parseDeepLinkConnect("?connect=Web%20Server%201&type=vnc")!,
+    );
+    expect(landing).toEqual({ kind: "saved", hostLabel: "Web Server 1" });
+    expect(double.connectHost).not.toHaveBeenCalled();
+    expect(double.openTab).not.toHaveBeenCalled();
+  });
+
+  it("reports a missing saved host without contacting the route", async () => {
+    const double = makeApp({ hosts: [] });
+    const landing = await resolveStandaloneLanding(
+      double.app,
+      parseDeepLinkConnect("?connect=Ghost&using=name")!,
+    );
+    expect(landing).toEqual({ kind: "unresolved", reason: "hostNotFound" });
+    expect(post).not.toHaveBeenCalled();
+    expect(double.confirm).not.toHaveBeenCalled();
+    expect(double.connectHost).not.toHaveBeenCalled();
+  });
+
+  it("reports a credential that does not resolve", async () => {
+    credentialState.credentials = [];
+    const double = makeApp();
+    const landing = await resolveStandaloneLanding(
+      double.app,
+      parseDeepLinkConnect(
+        "?connect=10.0.0.5&type=vnc&credential=Nope&using=adhoc",
+      )!,
+    );
+    expect(landing).toEqual({
+      kind: "unresolved",
+      reason: "credentialNotFound",
+    });
+    expect(post).not.toHaveBeenCalled();
+  });
+
+  it("reports an ad-hoc type no plugin provides", async () => {
+    const double = makeApp();
+    const landing = await resolveStandaloneLanding(
+      double.app,
+      parseDeepLinkConnect("?connect=10.0.0.5&type=telnet")!,
+    );
+    expect(landing).toEqual({ kind: "unresolved", reason: "typeUnknown" });
+    expect(double.connectHost).not.toHaveBeenCalled();
+  });
+
+  it("refuses to classify anything while the host list stays unreadable", async () => {
+    const double = makeApp();
+    double.listHosts.mockRejectedValue(new Error("list offline"));
+    vi.useFakeTimers();
+    const landing = resolveStandaloneLanding(
+      double.app,
+      parseDeepLinkConnect("?connect=Ghost")!,
+    );
+    await vi.advanceTimersByTimeAsync(2000);
+    const settled = await landing;
+    vi.useRealTimers();
+    expect(settled).toEqual({
+      kind: "unresolved",
+      reason: "listUnavailable",
+    });
+    expect(double.connectHost).not.toHaveBeenCalled();
+  });
+
+  it("treats a surface without a host list as list-unavailable", async () => {
+    const double = makeApp();
+    const bare = {} as unknown as TermixApp;
+    expect(
+      await resolveStandaloneLanding(
+        bare,
+        parseDeepLinkConnect("?connect=Ghost")!,
+      ),
+    ).toEqual({ kind: "unresolved", reason: "listUnavailable" });
+    expect(double.connectHost).not.toHaveBeenCalled();
+  });
+
+  it("adopts a credentialed ad-hoc link when the POST verifies", async () => {
+    const double = makeApp();
+    const landing = await resolveStandaloneLanding(
+      double.app,
+      parseDeepLinkConnect(
+        "?connect=10.0.0.5&type=vnc&credential=Deploy%20Key&using=adhoc",
+      )!,
+      { adoptApi: () => ({ post }) as unknown as PluginApiClient },
+    );
+    expect(landing).toEqual({ kind: "adopted", hostLabel: "10.0.0.5" });
+    expect(post).toHaveBeenCalledTimes(1);
+    expect(post).toHaveBeenCalledWith("/adopt", {
+      hostName: "10.0.0.5",
+      type: "vnc",
+      credentialId: 7,
+      // No port: the view has no protocol registry to default from, so the
+      // adopt route applies its own protocol default server-side.
+    });
+    // The shell store is woken up both ways (window events + the SDK
+    // bridge) so the app the user lands in can list the record.
+    expect(sdkNotify).toHaveBeenCalledTimes(1);
+    // Never a session from the standalone path: the tab bridge is dead
+    // there and its failures are unobservable.
+    expect(double.openTab).not.toHaveBeenCalled();
+    expect(double.connectHost).not.toHaveBeenCalled();
+    expect(double.confirm).not.toHaveBeenCalled();
+    expect(toastSuccess).not.toHaveBeenCalled();
+  });
+
+  it("trusts an 'exists' response too: the record is in Termix either way", async () => {
+    const double = makeApp();
+    const landing = await resolveStandaloneLanding(
+      double.app,
+      parseDeepLinkConnect(
+        "?connect=10.0.0.5&type=ssh&credential=Deploy%20Key&using=adhoc",
+      )!,
+      {
+        adoptApi: () =>
+          ({
+            post: vi.fn(async () => ({
+              data: { created: false, hostId: 9, reason: "exists" },
+            })),
+          }) as unknown as PluginApiClient,
+      },
+    );
+    expect(landing).toEqual({ kind: "adopted", hostLabel: "10.0.0.5" });
+    expect(double.connectHost).not.toHaveBeenCalled();
+  });
+
+  it("fails the adoption when the response carries no host id", async () => {
+    const double = makeApp();
+    const landing = await resolveStandaloneLanding(
+      double.app,
+      parseDeepLinkConnect(
+        "?connect=10.0.0.5&type=vnc&credential=Deploy%20Key&using=adhoc",
+      )!,
+      {
+        adoptApi: () =>
+          ({
+            post: vi.fn(async () => ({ data: { created: false } })),
+          }) as unknown as PluginApiClient,
+      },
+    );
+    expect(landing).toEqual({ kind: "adoptFailed" });
+    // No store wake either: nothing was saved, nothing to refresh.
+    expect(sdkNotify).not.toHaveBeenCalled();
+    expect(double.openTab).not.toHaveBeenCalled();
+    expect(double.connectHost).not.toHaveBeenCalled();
+  });
+
+  it("fails the adoption when the route refuses", async () => {
+    const double = makeApp();
+    post.mockRejectedValueOnce(new Error("404"));
+    const landing = await resolveStandaloneLanding(
+      double.app,
+      parseDeepLinkConnect(
+        "?connect=10.0.0.5&type=vnc&credential=Deploy%20Key&using=adhoc",
+      )!,
+      { adoptApi: () => ({ post }) as unknown as PluginApiClient },
+    );
+    expect(landing).toEqual({ kind: "adoptFailed" });
+    expect(sdkNotify).not.toHaveBeenCalled();
+    expect(double.connectHost).not.toHaveBeenCalled();
+  });
+
+  it("fails the adoption when no api surface can carry the POST", async () => {
+    const double = makeApp();
+    // makeApp omits `api` and no adoptApi is injected: nothing can POST.
+    const landing = await resolveStandaloneLanding(
+      double.app,
+      parseDeepLinkConnect(
+        "?connect=10.0.0.5&type=vnc&credential=Deploy%20Key&using=adhoc",
+      )!,
+    );
+    expect(landing).toEqual({ kind: "adoptFailed" });
+    expect(double.openTab).not.toHaveBeenCalled();
+  });
+
+  it("refuses a credential-less ad-hoc link with no adopt and no tab", async () => {
+    const double = makeApp();
+    const landing = await resolveStandaloneLanding(
+      double.app,
+      parseDeepLinkConnect("?connect=10.0.0.5&type=vnc&using=adhoc")!,
+    );
+    expect(landing).toEqual({ kind: "cannotAdopt" });
+    expect(post).not.toHaveBeenCalled();
+    expect(sdkNotify).not.toHaveBeenCalled();
+    expect(double.openTab).not.toHaveBeenCalled();
+    expect(double.connectHost).not.toHaveBeenCalled();
+  });
+
+  it("refuses a type the adopt route cannot create as typeUnknown", async () => {
+    // THE VIEW'S CLASSIFICATION SET IS THE ADOPT ROUTE'S SET: on the ?view=
+    // page the protocol registry never populates (the shell never mounts
+    // there), and no other client-side type list exists — the route's
+    // accepted set (ssh/vnc/rdp, ADOPTABLE_TYPES in src/backend/adopt.ts,
+    // mirrored in connect-plan) is the whole classification. A registered-
+    // elsewhere or fake type never adopts and keeps the typeUnknown refusal.
+    const double = makeApp();
+    const landing = await resolveStandaloneLanding(
+      double.app,
+      parseDeepLinkConnect(
+        "?connect=10.0.0.5&type=custom-proto&credential=Deploy%20Key&using=adhoc",
+      )!,
+    );
+    expect(landing).toEqual({ kind: "unresolved", reason: "typeUnknown" });
+    expect(post).not.toHaveBeenCalled();
+    expect(double.openTab).not.toHaveBeenCalled();
+    expect(double.connectHost).not.toHaveBeenCalled();
+  });
+
+  it("adopts a vnc link on the registry-less view with zero protocol-registry waits", async () => {
+    // THE FIX PASS REGRESSION: a real view page's registry NEVER fills (the
+    // shell never mounts there) and the old landing spent its settle budget
+    // polling it and then refused with typeUnknown — dead VNC console links.
+    // The landing must classify the adoption by the link's own type instead:
+    // no listHostProtocols call at all, and no settle wait (resolves in real
+    // time far under the old 1500ms poll budget).
+    listProtocols.mockReturnValue([] as never); // the live view's truth
+    const double = makeApp();
+    const started = Date.now();
+    const landing = await resolveStandaloneLanding(
+      double.app,
+      parseDeepLinkConnect(
+        "?connect=10.0.0.5&type=vnc&credential=Deploy%20Key&using=adhoc",
+      )!,
+      { adoptApi: () => ({ post }) as unknown as PluginApiClient },
+    );
+    expect(Date.now() - started).toBeLessThan(1000);
+    expect(listProtocols).not.toHaveBeenCalled();
+    expect(landing).toEqual({ kind: "adopted", hostLabel: "10.0.0.5" });
+    // The rest of the settle is intact: the credential list was still read
+    // (the SDK module the landing falls back to — the double has no
+    // app-level list) before the adoption rode.
+    expect(sdkListCredentials).toHaveBeenCalledTimes(1);
+  });
+
+  it("carries an explicit port and domain through the intent-classified adoption", async () => {
+    const double = makeApp();
+    const landing = await resolveStandaloneLanding(
+      double.app,
+      parseDeepLinkConnect(
+        "?connect=10.0.0.5&type=rdp&domain=WAG&port=3390&credential=Deploy%20Key&using=adhoc",
+      )!,
+      { adoptApi: () => ({ post }) as unknown as PluginApiClient },
+    );
+    expect(landing).toEqual({ kind: "adopted", hostLabel: "10.0.0.5" });
+    expect(post).toHaveBeenCalledWith("/adopt", {
+      hostName: "10.0.0.5",
+      type: "rdp",
+      credentialId: 7,
+      port: 3390,
+      domain: "WAG",
+    });
+  });
+
+  it("never leaves a module-scoped state behind between landings", async () => {
+    const failing = makeApp({ hosts: [] });
+    await resolveStandaloneLanding(
+      failing.app,
+      parseDeepLinkConnect("?connect=Ghost&using=name")!,
+    );
+    const working = makeApp();
+    const landing = await resolveStandaloneLanding(
+      working.app,
+      parseDeepLinkConnect("?connect=Web%20Server%201")!,
+    );
+    expect(landing).toEqual({ kind: "saved", hostLabel: "Web Server 1" });
+  });
+});
+
+describe("startTermixLinkConsumer", () => {
+  function linkSettings() {
+    return {
+      settleBudgetMs: 200,
+      pollMs: 10,
+      defaultTabBudgetMs: 100,
+    };
+  }
+
+  it("no-ops when the shell does not expose the deepLinks seam", () => {
+    const double = makeApp();
+    startTermixLinkConsumer(double.app, linkSettings());
+    expect(double.confirm).not.toHaveBeenCalled();
+    // The registration never even reached a listener.
+    expect(double.onOpen).not.toHaveBeenCalled();
+  });
+
+  it("connects a query-form link through the same grammar and confirm", async () => {
+    const double = makeApp({
+      queuedLinks: [
+        {
+          url: "termix://deep-connect?connect=Web%20Server%201",
+          source: "os-scheme",
+        },
+      ],
+    });
+    defaultTab.mockReturnValue("terminal" as never);
+    vi.useFakeTimers();
+    startTermixLinkConsumer(double.app, linkSettings());
+    await vi.advanceTimersByTimeAsync(300);
+    expect(double.confirm).toHaveBeenCalledTimes(1);
+    expect(double.connectHost).toHaveBeenCalledWith(hosts[0], "terminal");
+  });
+
+  it("parses the path form and a registered protocol type", async () => {
+    const double = makeApp({
+      queuedLinks: [
+        { url: "termix://connect/10.0.0.5?type=vnc", source: "os-scheme" },
+      ],
+    });
+    vi.useFakeTimers();
+    startTermixLinkConsumer(double.app, linkSettings());
+    await vi.advanceTimersByTimeAsync(300);
+    expect(double.confirm).toHaveBeenCalledTimes(1);
+    expect(double.connectHost.mock.calls[0][1]).toBe("vnc");
+    const host = double.connectHost.mock.calls[0][0] as Record<string, unknown>;
+    expect(host.connectionType).toBe("vnc");
+  });
+
+  it("confirms command-line links too — every source confirms first", async () => {
+    const double = makeApp({
+      queuedLinks: [
+        { url: "termix://connect/10.0.0.5?type=vnc", source: "command-line" },
+      ],
+    });
+    vi.useFakeTimers();
+    startTermixLinkConsumer(double.app, linkSettings());
+    await vi.advanceTimersByTimeAsync(300);
+    expect(double.confirm).toHaveBeenCalledTimes(1);
+    expect(double.connectHost).toHaveBeenCalledTimes(1);
+  });
+
+  it("ignores core's termix://host/<id> links entirely", async () => {
+    const double = makeApp({
+      queuedLinks: [
+        { url: "termix://host/12", source: "os-scheme" },
+        { url: "termix://host/12?connect=web-01", source: "os-scheme" },
+      ],
+    });
+    vi.useFakeTimers();
+    startTermixLinkConsumer(double.app, linkSettings());
+    await vi.advanceTimersByTimeAsync(300);
+    expect(double.confirm).not.toHaveBeenCalled();
+    expect(double.connectHost).not.toHaveBeenCalled();
+  });
+
+  it("runs replayed links one at a time in arrival order", async () => {
+    const double = makeApp({
+      queuedLinks: [
+        { url: "termix://connect/Web%20Server%201", source: "os-scheme" },
+        { url: "termix://connect/10.0.0.5?type=vnc", source: "os-scheme" },
+        { url: "termix://connect/bogus%%target?type=vnc", source: "os-scheme" },
+      ],
+    });
+    // The saved-host link connects through the polled default connection.
+    defaultTab.mockReturnValueOnce("terminal" as never);
+    vi.useFakeTimers();
+    startTermixLinkConsumer(double.app, linkSettings());
+    await vi.advanceTimersByTimeAsync(500);
+    expect(double.confirm).toHaveBeenCalledTimes(2);
+    expect(double.confirm.mock.calls[0][0].title).toContain("Web Server 1");
+    expect(double.confirm.mock.calls[1][0].title).not.toContain("Web Server 1");
+    expect(double.connectHost).toHaveBeenCalledTimes(2);
+    // Strict arrival order: each link completed before the next started.
+    expect(double.confirm.mock.invocationCallOrder[0]).toBeLessThan(
+      double.confirm.mock.invocationCallOrder[1],
+    );
+  });
+
+  it("ignores a replayed link after re-registration, and runs a new link", async () => {
+    const double = makeApp({
+      queuedLinks: [
+        { url: "termix://connect/Web%20Server%201", source: "os-scheme" },
+      ],
+    });
+    defaultTab.mockReturnValue("terminal" as never);
+    vi.useFakeTimers();
+    // First registration: core replays the launch link; it confirms once.
+    startTermixLinkConsumer(double.app, linkSettings());
+    await vi.advanceTimersByTimeAsync(300);
+    expect(double.confirm).toHaveBeenCalledTimes(1);
+    expect(double.connectHost).toHaveBeenCalledTimes(1);
+    // Plugin disable/enable: the disposer fires, activate registers again,
+    // and core replays the SAME link object to the new listener. The replay
+    // must NOT enqueue or re-confirm the already-consumed link.
+    double.disposeAll();
+    startTermixLinkConsumer(double.app, linkSettings());
+    await vi.advanceTimersByTimeAsync(300);
+    expect(double.confirm).toHaveBeenCalledTimes(1);
+    expect(double.connectHost).toHaveBeenCalledTimes(1);
+    // A genuinely new delivery (a fresh link object — the guard is identity,
+    // not the URL) still runs, after the replayed delivery was dropped.
+    double.deliverLink({
+      url: "termix://connect/10.0.0.5?type=vnc",
+      source: "os-scheme",
+    });
+    await vi.advanceTimersByTimeAsync(300);
+    expect(double.confirm).toHaveBeenCalledTimes(2);
+    expect(double.connectHost).toHaveBeenCalledTimes(2);
+    expect(double.connectHost.mock.calls[1][1]).toBe("vnc");
+  });
+
+  it("carries the credential id and view-only flag through a termix link", async () => {
+    const double = makeApp({
+      queuedLinks: [
+        {
+          url: "termix://connect/10.0.0.5?type=vnc&credential=deploy%20key&viewonly=1",
+          source: "os-scheme",
+        },
+      ],
+    });
+    vi.useFakeTimers();
+    startTermixLinkConsumer(double.app, linkSettings());
+    await vi.advanceTimersByTimeAsync(300);
+    expect(double.confirm).toHaveBeenCalledTimes(1);
+    const host = double.connectHost.mock.calls[0][0] as Record<string, unknown>;
+    expect(host.quickConnectLogin).toMatchObject({
+      protocol: "vnc",
+      credentialId: 7,
+      viewOnly: true,
+    });
+  });
+
+  it("surfaces refusals as toasts without confirming anything", async () => {
+    const double = makeApp({
+      queuedLinks: [{ url: "termix://connect/ghost", source: "os-scheme" }],
+    });
+    vi.useFakeTimers();
+    startTermixLinkConsumer(double.app, linkSettings());
+    await vi.advanceTimersByTimeAsync(300);
+    expect(toastError).toHaveBeenCalledWith(
+      double.t("deepLink.hostNotFound", { host: "ghost" }),
+    );
+    expect(double.confirm).not.toHaveBeenCalled();
   });
 });

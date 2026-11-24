@@ -52,22 +52,34 @@ Every parameter is optional except `connect`:
 | `port`       | Port override (ad-hoc connects only)                            |
 | `domain`     | AD domain for ad-hoc RDP direct auth                            |
 | `using`      | `adhoc` forces an ad-hoc connect; `name` forces the host lookup |
-| `viewonly`   | Reserved (parsed, shown in the confirm text, not applied yet)   |
+| `viewonly`   | Ad-hoc RDP/VNC: session opens with input off (exact `1` only)   |
 
 `credential` and `port` must be percent-encoded when they contain spaces or special
 characters.
 
 ## Caveats
 
-- The link carries **names only, never secrets**. The confirm dialog always shows first;
-  cancelling clears the link from the URL.
+- The link carries **names only, never secrets**. The confirm card in the plugin's own view
+  always shows first; cancelling opens nothing.
 - **Saved hosts** connect with their own stored log-ins — a `credential=` name is verified
   and shown in the confirm text, but does not replace the host's login.
-- **Ad-hoc links** cannot carry a stored password or key: the session stops at Termix's
-  own prompt (SSH) or remote-desktop's prompt (RDP/VNC), and the confirm dialog states it.
-- Signed-out browsers get the Termix login first and return to the link; unknown
-  parameters and `view=` are dropped on the way by the hand-off page.
-- Termix needs engine 26.11.1 or newer and the plugin enabled for your role
+- **Ad-hoc links** carry names, never secrets. An RDP/VNC link with a matching `credential=` name
+  connects by credential id (resolved server-side by the protocol plugin — the secret never
+  reaches the browser); without any `credential=` the in-app flow stops at remote-desktop's
+  own prompt, while the web `?view=` page refuses it (nothing to attach saved, nothing
+  opened). An unmatched credential name is refused rather than prompting or downgrading. An
+  SSH link adopts a saved host or stops at Termix's own SSH prompt. The confirm text always
+  states what will be used.
+- Keep asset actions on the `?view=deep-connect&…` form: a bare `/?connect=…` URL is only
+  routed by the desktop app, not by the web UI.
+- Signed-out browsers get the Termix login first and return to the link.
+- The web view finishes the link honestly: it confirms first, saves a record only when the
+  link carries a usable `credential=` and the save is verified by the backend response,
+  then opens Termix in one new tab where the session is started from the Hosts list. The
+  view never opens a session itself; links that cannot finish there (no credential to
+  attach, an unknown host or credential name, a failed save) end in a plain refusal or
+  error card that opens nothing.
+- Termix needs engine 26.11.3 or newer and the plugin enabled for your role
   (admins and users by default).
 - Verify the template-token syntax against your own Lansweeper version before rollout —
   it varies between releases.

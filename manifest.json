@@ -1,7 +1,7 @@
 {
   "id": "deep-connect",
   "name": "Deep Connect",
-  "version": "1.2.0",
+  "version": "2.0.0",
   "description": "Opens Termix sessions from URLs (URI → session launcher): connects saved hosts or ad-hoc addresses over SSH, RDP or VNC, with a confirm before every connect.",
   "author": {
     "name": "Andrew Hancock",
@@ -17,11 +17,12 @@
     "Saved hosts connect by name or address with their own logins",
     "Ad-hoc quick connects to addresses over SSH, RDP or VNC",
     "On your confirm, ad-hoc links can become saved hosts in the Ad-Hoc Hosts folder with a credential attached by reference",
-    "Every connect shows a confirm dialog first; links never carry secrets"
+    "Every connect shows a confirm dialog first; links never carry secrets",
+    "Desktop termix:// links connect through the same grammar, on the same confirm"
   ],
   "engine": {
-    "termix": ">=26.11.0-0",
-    "api": "^1.13"
+    "termix": ">=26.11.3-0",
+    "api": "2"
   },
   "capabilities": [
     "ui:surface",
@@ -36,9 +37,7 @@
         "id": "deep-connect",
         "titleKey": "tab.title",
         "icon": "Monitor",
-        "openFrom": [
-          "palette"
-        ]
+        "openFrom": ["palette"]
       }
     ],
     "permissions": [
@@ -46,17 +45,10 @@
         "name": "use",
         "titleKey": "permissions.use.title",
         "descriptionKey": "permissions.use.description",
-        "defaultRoles": [
-          "admin",
-          "user"
-        ]
+        "defaultRoles": ["admin", "user"]
       }
     ]
   },
   "locales": "locales",
-  "platforms": [
-    "linux",
-    "win32",
-    "darwin"
-  ]
+  "platforms": ["linux", "win32", "darwin"]
 }

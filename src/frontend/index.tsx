@@ -3,10 +3,12 @@ import {
   type TabProps,
   type TermixApp,
 } from "@termix-ssh/plugin-sdk/frontend";
-import { startDeepLinkConsumer } from "./consumer";
+import { startDeepLinkConsumer, startTermixLinkConsumer } from "./consumer";
+import { STANDALONE_VIEW_ID } from "./deep-link";
 import { StandaloneHandoff } from "./StandaloneHandoff";
+import { setStandaloneApp } from "./standalone-app";
 
-const TAB_ID = "deep-connect";
+const TAB_ID = STANDALONE_VIEW_ID;
 
 /**
  * The palette-opened tab is deliberately a stub: the real entry points are
@@ -46,6 +48,11 @@ function MonitorIcon(props: { className?: string }) {
 }
 
 export function activate(app: TermixApp): void {
+  // The standalone ?view= component only gets `view` + `params`; the app
+  // surface rides activate (the frame's bridge). Held for the hand-off's
+  // honest landing (list fetches, the adoption POST); absent/unusable → the
+  // view refuses in place instead of claiming anything.
+  setStandaloneApp(app);
   app.registerTab(TAB_ID, createStubTab(), {
     icon: MonitorIcon,
     titleKey: "tab.title",
@@ -55,4 +62,7 @@ export function activate(app: TermixApp): void {
     standalone: StandaloneHandoff,
   });
   startDeepLinkConsumer(app);
+  // Desktop termix:// links (26.11.3): same grammar, same confirm. No-op
+  // where the shell does not expose the seam (web browsers).
+  startTermixLinkConsumer(app);
 }
